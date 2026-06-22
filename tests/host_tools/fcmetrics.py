@@ -12,13 +12,16 @@ import json
 import logging
 import math
 import platform
+import re
 import time
 from threading import Thread
 
 import jsonschema
 import pytest
 
+from framework import utils
 from framework.properties import global_props
+from framework.utils_repo import git_repo_files
 from host_tools.metrics import get_metrics_logger
 
 
@@ -99,13 +102,11 @@ def validate_fc_metrics(metrics):
     net_metrics = [
         "activate_fails",
         "cfg_fails",
-        "mac_address_updates",
         "no_rx_avail_buffer",
         "no_tx_avail_buffer",
         "event_fails",
         "rx_queue_event_count",
         "rx_event_rate_limiter_count",
-        "rx_partial_writes",
         "rx_rate_limiter_throttled",
         "rx_tap_event_count",
         "rx_bytes_count",
@@ -119,7 +120,6 @@ def validate_fc_metrics(metrics):
         "tx_fails",
         "tx_count",
         "tx_packets_count",
-        "tx_partial_reads",
         "tx_queue_event_count",
         "tx_rate_limiter_event_count",
         "tx_rate_limiter_throttled",
@@ -132,8 +132,6 @@ def validate_fc_metrics(metrics):
         "api_server": [
             "process_startup_time_us",
             "process_startup_time_cpu_us",
-            "sync_response_fails",
-            "sync_vmm_send_timeout_count",
         ],
         "balloon": [
             "activate_fails",
@@ -142,17 +140,23 @@ def validate_fc_metrics(metrics):
             "stats_update_fails",
             "deflate_count",
             "event_fails",
+            "free_page_report_count",
+            "free_page_report_freed",
+            "free_page_report_fails",
+            "free_page_hint_count",
+            "free_page_hint_freed",
+            "free_page_hint_fails",
         ],
         "block": block_metrics,
         "deprecated_api": [
             "deprecated_http_api_calls",
-            "deprecated_cmd_line_api_calls",
         ],
         "get_api_requests": [
             "instance_info_count",
             "machine_cfg_count",
             "mmds_count",
             "vmm_version_count",
+            "hotplug_memory_count",
         ],
         "i8042": [
             "error_count",
@@ -178,7 +182,7 @@ def validate_fc_metrics(metrics):
             "missed_metrics_count",
             "metrics_fails",
             "missed_log_count",
-            "log_fails",
+            "rate_limited_log_count",
         ],
         "mmds": [
             "rx_accepted",
@@ -205,6 +209,10 @@ def validate_fc_metrics(metrics):
             "machine_cfg_fails",
             "mmds_count",
             "mmds_fails",
+            "hotplug_memory_count",
+            "hotplug_memory_fails",
+            "pmem_count",
+            "pmem_fails",
         ],
         "put_api_requests": [
             "actions_count",
@@ -227,8 +235,12 @@ def validate_fc_metrics(metrics):
             "mmds_fails",
             "vsock_count",
             "vsock_fails",
+            "pmem_count",
+            "pmem_fails",
             "serial_count",
             "serial_fails",
+            "hotplug_memory_count",
+            "hotplug_memory_fails",
         ],
         "seccomp": [
             "num_faults",
@@ -246,7 +258,6 @@ def validate_fc_metrics(metrics):
             {"exit_mmio_write_agg": latency_agg_metrics_fields},
         ],
         "vmm": [
-            "device_events",
             "panic_count",
         ],
         "uart": [
@@ -256,6 +267,7 @@ def validate_fc_metrics(metrics):
             "missed_write_count",
             "read_count",
             "write_count",
+            "rate_limiter_dropped_bytes",
         ],
         "signals": [
             "sigbus",
@@ -296,6 +308,35 @@ def validate_fc_metrics(metrics):
             "host_rng_fails",
             "entropy_rate_limiter_throttled",
             "rate_limiter_event_count",
+        ],
+        "interrupts": ["triggers", "config_updates"],
+        "pmem": [
+            "activate_fails",
+            "cfg_fails",
+            "event_fails",
+            "queue_event_count",
+            "rate_limiter_throttled_events",
+            "rate_limiter_event_count",
+        ],
+        "memory_hotplug": [
+            "activate_fails",
+            "queue_event_fails",
+            "queue_event_count",
+            "plug_count",
+            "plug_bytes",
+            "plug_fails",
+            {"plug_agg": latency_agg_metrics_fields},
+            "unplug_count",
+            "unplug_bytes",
+            "unplug_fails",
+            "unplug_discard_fails",
+            {"unplug_agg": latency_agg_metrics_fields},
+            "state_count",
+            "state_fails",
+            {"state_agg": latency_agg_metrics_fields},
+            "unplug_all_count",
+            "unplug_all_fails",
+            {"unplug_all_agg": latency_agg_metrics_fields},
         ],
     }
 
@@ -483,7 +524,10 @@ def flush_fc_metrics_to_cw(fc_metrics, metrics):
     failure_metrics = {
         key: value
         for key, value in flattened_metrics.items()
-        if "err" in key or "fail" in key or "panic" in key or "num_faults" in key
+        if "err" in key.split(".")[-1]
+        or "fail" in key.split(".")[-1]
+        or "panic" in key.split(".")[-1]
+        or "num_faults" in key.split(".")[-1]
         if value
         if key not in ignored_failure_metrics
     }
@@ -570,3 +614,99 @@ class FCMetricsMonitor(Thread):
                 time.sleep(1)
                 if self.running is False:
                     break
+
+
+def find_metrics_files():
+    """Gets a list of all Firecracker sources files ending with 'metrics.rs'"""
+    return list(git_repo_files(root="..", glob="*metrics.rs"))
+
+
+def extract_fields(file_path):
+    """Gets a list of all metrics defined in the given file, in the form tuples (name, type)"""
+    fields = utils.run_cmd(
+        rf'grep -Po "(?<=pub )(\w+): (Shared(?:Inc|Store)Metric|LatencyAggregateMetrics)" {file_path}'
+    ).stdout.strip()
+
+    return [field.split(": ", maxsplit=1) for field in fields.splitlines()]
+
+
+def is_file_test_or_definition(filepath):
+    """Returns True for test files and metrics definition files, where field
+    references should not count as production usage."""
+    path = filepath.lower()
+    return (
+        "/test/" in path
+        or "/tests/" in path
+        or path.endswith("_test.rs")
+        or "test_" in path
+        or "tests.rs" in path
+        or ("metrics.rs" in path and "vmm" in path)
+    )
+
+
+KNOWN_FALSE_POSITIVES = [
+    "min_us",
+    "max_us",
+    "sum_us",
+    "process_startup_time_us",
+    "process_startup_time_cpu_us",
+]
+
+
+def find_unused_metrics():
+    """Find all unused metrics in a single grep pass instead of one per field.
+
+    Returns a dict mapping metrics file paths to lists of (field, type) tuples
+    for metrics that have no production usage.
+    """
+    metrics_files = find_metrics_files()
+    if not metrics_files:
+        return {}
+
+    all_fields = []
+    for file_path in metrics_files:
+        for field, ty in extract_fields(file_path):
+            all_fields.append((file_path, field, ty))
+
+    if not all_fields:
+        return {}
+
+    non_fp_fields = [
+        (fp, f, t) for fp, f, t in all_fields if f not in KNOWN_FALSE_POSITIVES
+    ]
+    if not non_fp_fields:
+        return {}
+
+    # One grep for all field names
+    field_names = sorted({f for _, f, _ in non_fp_fields})
+    combined = "|".join(field_names)
+    result = utils.run_cmd(f'grep -rPn "{combined}" ../src')
+
+    used_fields = set()
+    for line in result.stdout.strip().splitlines():
+        if not line:
+            continue
+        parts = line.split(":", maxsplit=2)
+        if len(parts) < 3:
+            continue
+        filepath, _, code = parts
+        if is_file_test_or_definition(filepath):
+            continue
+        # Strip comments and string literals so we only match real code.
+        code = code.lstrip()
+        if code.startswith("//") or code.startswith("/*") or code.startswith("*"):
+            continue
+        code = re.sub(r"//.*", "", code)
+        code = re.sub(r'"[^"]*"', "", code)
+        for field in field_names:
+            if field in code:
+                used_fields.add(field)
+
+    unused = {}
+    for file_path, field, ty in all_fields:
+        if field in KNOWN_FALSE_POSITIVES:
+            continue
+        if field not in used_fields:
+            unused.setdefault(file_path, []).append((field, ty))
+
+    return unused

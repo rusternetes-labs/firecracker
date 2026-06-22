@@ -9,13 +9,16 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::ActivateError;
 use super::queue::{Queue, QueueError};
 use super::transport::VirtioInterrupt;
+use crate::MutEventSubscriber;
 use crate::devices::virtio::AsAny;
-use crate::logger::warn;
+use crate::devices::virtio::generated::virtio_ids;
+use crate::logger::{error, info, warn};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// State of an active VirtIO device
@@ -51,13 +54,32 @@ impl DeviceState {
     }
 }
 
+/// Type of a virtio device
+/// Represent it as u8 to give it a known size.
+/// All used types fit in u8.
+#[allow(clippy::cast_possible_truncation)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VirtioDeviceType {
+    Net = virtio_ids::VIRTIO_ID_NET as u8,
+    Block = virtio_ids::VIRTIO_ID_BLOCK as u8,
+    Rng = virtio_ids::VIRTIO_ID_RNG as u8,
+    Balloon = virtio_ids::VIRTIO_ID_BALLOON as u8,
+    Vsock = virtio_ids::VIRTIO_ID_VSOCK as u8,
+    Mem = virtio_ids::VIRTIO_ID_MEM as u8,
+    Pmem = virtio_ids::VIRTIO_ID_PMEM as u8,
+}
+
+/// Unique identifier for a virtio device: its type and string ID.
+pub type VirtioDeviceId = (VirtioDeviceType, String);
+
 /// Trait for virtio devices to be driven by a virtio transport.
 ///
 /// The lifecycle of a virtio device is to be moved to a virtio transport, which will then query the
 /// device. The virtio devices needs to create queues, events and event fds for interrupts and
 /// expose them to the transport via get_queues/get_queue_events/get_interrupt/get_interrupt_status
 /// fns.
-pub trait VirtioDevice: AsAny + Send {
+pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     /// Get the available features offered by device.
     fn avail_features(&self) -> u64;
 
@@ -75,14 +97,17 @@ pub trait VirtioDevice: AsAny + Send {
     }
 
     /// The virtio device type (as a constant of the struct).
-    fn const_device_type() -> u32
+    fn const_device_type() -> VirtioDeviceType
     where
         Self: Sized;
 
     /// The virtio device type.
     ///
     /// It should be the same as returned by Self::const_device_type().
-    fn device_type(&self) -> u32;
+    fn device_type(&self) -> VirtioDeviceType;
+
+    /// Returns unique device id
+    fn id(&self) -> &str;
 
     /// Returns the device queues.
     fn queues(&self) -> &[Queue];
@@ -167,13 +192,36 @@ pub trait VirtioDevice: AsAny + Send {
         Ok(())
     }
 
+    /// Notify all queues by writing to the eventfds.
+    fn notify_queue_events(&mut self) {
+        info!("[{:?}:{}] notifying queues", self.device_type(), self.id());
+        for (i, eventfd) in self.queue_events().iter().enumerate() {
+            if let Err(err) = eventfd.write(1) {
+                error!(
+                    "[{:?}:{}] error notifying queue {}: {}",
+                    self.device_type(),
+                    self.id(),
+                    i,
+                    err
+                );
+            }
+        }
+    }
+
     /// Kick the device, as if it had received external events.
-    fn kick(&mut self) {}
+    fn kick(&mut self) {
+        if self.is_activated() {
+            self.notify_queue_events();
+        }
+    }
+
+    /// Prepare the device for saving its state
+    fn prepare_save(&mut self) {}
 }
 
 impl fmt::Debug for dyn VirtioDevice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "VirtioDevice type {}", self.device_type())
+        write!(f, "VirtioDevice type {:?}", self.device_type())
     }
 }
 
@@ -181,11 +229,11 @@ impl fmt::Debug for dyn VirtioDevice {
 #[macro_export]
 macro_rules! impl_device_type {
     ($const_type:expr) => {
-        fn const_device_type() -> u32 {
+        fn const_device_type() -> VirtioDeviceType {
             $const_type
         }
 
-        fn device_type(&self) -> u32 {
+        fn device_type(&self) -> VirtioDeviceType {
             Self::const_device_type()
         }
     };
@@ -193,26 +241,38 @@ macro_rules! impl_device_type {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use event_manager::{EventOps, Events, MutEventSubscriber};
+
     use super::*;
 
     #[derive(Debug)]
     struct MockVirtioDevice {
+        avail_features: u64,
         acked_features: u64,
     }
 
+    impl MutEventSubscriber for MockVirtioDevice {
+        fn process(&mut self, _: Events, _: &mut EventOps) {}
+        fn init(&mut self, _: &mut EventOps) {}
+    }
+
     impl VirtioDevice for MockVirtioDevice {
-        impl_device_type!(0);
+        impl_device_type!(VirtioDeviceType::Net);
+
+        fn id(&self) -> &str {
+            "mock"
+        }
 
         fn avail_features(&self) -> u64 {
-            todo!()
+            self.avail_features
         }
 
         fn acked_features(&self) -> u64 {
             self.acked_features
         }
 
-        fn set_acked_features(&mut self, _acked_features: u64) {
-            todo!()
+        fn set_acked_features(&mut self, acked_features: u64) {
+            self.acked_features = acked_features
         }
 
         fn queues(&self) -> &[Queue] {
@@ -254,7 +314,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_has_feature() {
-        let mut device = MockVirtioDevice { acked_features: 0 };
+        let mut device = MockVirtioDevice {
+            avail_features: 0,
+            acked_features: 0,
+        };
 
         let mock_feature_1 = 1u64;
         assert!(!device.has_feature(mock_feature_1));
@@ -266,5 +329,30 @@ pub(crate) mod tests {
         device.acked_features = (1 << mock_feature_1) | (1 << mock_feature_2);
         assert!(device.has_feature(mock_feature_1));
         assert!(device.has_feature(mock_feature_2));
+    }
+
+    #[test]
+    fn test_features() {
+        let features: u64 = 0x11223344_55667788;
+
+        let mut device = MockVirtioDevice {
+            avail_features: features,
+            acked_features: 0,
+        };
+
+        assert_eq!(
+            device.avail_features_by_page(0),
+            (features & 0xFFFFFFFF) as u32,
+        );
+        assert_eq!(device.avail_features_by_page(1), (features >> 32) as u32);
+        for i in 2..10 {
+            assert_eq!(device.avail_features_by_page(i), 0u32);
+        }
+
+        for i in 0..10 {
+            device.ack_features_by_page(i, u32::MAX);
+        }
+
+        assert_eq!(device.acked_features, features);
     }
 }

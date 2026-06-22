@@ -6,55 +6,132 @@ Script for running A/B-Tests
 
 The script takes two git revisions and a pytest integration test. It utilizes
 our integration test frameworks --binary-dir parameter to execute the given
-test using binaries compiled from each revision, and captures the EMF logs
-output. It the searches for list-valued properties/metrics in the EMF, and runs a
-regression test comparing these lists for the two runs.
+test using binaries compiled from each revision, and runs a regression test
+comparing resulting metrics between runs.
 
 It performs the A/B-test as follows:
-For each EMF log message output, look at the dimensions. The script assumes that
-dimensions are unique across all log messages output from a single test run. In
-each log message, then look for all properties that have lists assigned to them,
-and collect them. For both runs of the test, the set of distinct dimensions
-collected this way must be the same. Then, we match corresponding dimensions
-between the two runs, performing statistical regression test across all the list-
-valued properties collected.
+For both A and B runs, collect all `metrics.json` files and read all dimentions
+from them. Script assumes all dimentions are unique within single run and both
+A and B runs result in the same dimentions. After collection is done, perform
+statistical regression test across all the list-valued properties collected.
 """
 
 import argparse
+import glob
 import json
 import os
-import statistics
+import shutil
 import subprocess
-import sys
+import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, List, Optional
 
-# Hack to be able to use our test framework code
-sys.path.append(str(Path(__file__).parent.parent / "tests"))
+import numpy
+import scipy
 
-# pylint:disable=wrong-import-position
-from framework.ab_test import binary_ab_test, check_regression
-from framework.properties import global_props
-from host_tools.metrics import (
-    emit_raw_emf,
-    format_with_reduced_unit,
-    get_metrics_logger,
-)
+UNIT_REDUCTIONS = {
+    "Microseconds": "Milliseconds",
+    "Milliseconds": "Seconds",
+    "Bytes": "Kilobytes",
+    "Kilobytes": "Megabytes",
+    "Megabytes": "Gigabytes",
+    "Gigabytes": "Terabytes",
+    "Bits": "Kilobits",
+    "Kilobits": "Megabits",
+    "Megabits": "Gigabits",
+    "Gigabits": "Terabit",
+    "Bytes/Second": "Kilobytes/Second",
+    "Kilobytes/Second": "Megabytes/Second",
+    "Megabytes/Second": "Gigabytes/Second",
+    "Gigabytes/Second": "Terabytes/Second",
+    "Bits/Second": "Kilobits/Second",
+    "Kilobits/Second": "Megabits/Second",
+    "Megabits/Second": "Gigabits/Second",
+    "Gigabits/Second": "Terabits/Second",
+}
+INV_UNIT_REDUCTIONS = {v: k for k, v in UNIT_REDUCTIONS.items()}
 
-# Performance tests that are known to be unstable and exhibit variances of up to 60% of the mean
+UNIT_SHORTHANDS = {
+    "Seconds": "s",
+    "Microseconds": "μs",
+    "Milliseconds": "ms",
+    "Bytes": "B",
+    "Kilobytes": "KB",
+    "Megabytes": "MB",
+    "Gigabytes": "GB",
+    "Terabytes": "TB",
+    "Bits": "Bit",
+    "Kilobits": "KBit",
+    "Megabits": "MBit",
+    "Gigabits": "GBit",
+    "Terabits": "TBit",
+    "Percent": "%",
+    "Count": "",
+    "Bytes/Second": "B/s",
+    "Kilobytes/Second": "KB/s",
+    "Megabytes/Second": "MB/s",
+    "Gigabytes/Second": "GB/s",
+    "Terabytes/Second": "TB/s",
+    "Bits/Second": "Bit/s",
+    "Kilobits/Second": "KBit/s",
+    "Megabits/Second": "MBit/s",
+    "Gigabits/Second": "GBit/s",
+    "Terabits/Second": "TBit/s",
+    "Count/Second": "Hz",
+    "None": "",
+}
+
+
+def reduce_value(value, unit):
+    """
+    Utility function for expressing a value in the largest possible unit in which it would still be >= 1
+
+    For example, `reduce_value(1_000_000, Bytes)` would return (1, Megabytes)
+    """
+    # Could do this recursively, but I am worried about infinite recursion
+    # due to precision problems (e.g. infinite loop of dividing/multiplying by 1000, alternating
+    # between values < 1 and >= 1000).
+    while abs(value) < 1 and unit in INV_UNIT_REDUCTIONS:
+        value *= 1000
+        unit = INV_UNIT_REDUCTIONS[unit]
+    while abs(value) >= 1000 and unit in UNIT_REDUCTIONS:
+        value /= 1000
+        unit = UNIT_REDUCTIONS[unit]
+
+    return value, unit
+
+
+def format_with_reduced_unit(value, unit):
+    """
+    Utility function for pretty printing a given value by choosing a unit as large as possible,
+    and then outputting its shorthand.
+
+    For example, `format_with_reduced_unit(1_000_000, Bytes)` would return "1MB".
+    """
+    reduced_value, reduced_unit = reduce_value(value, unit)
+    formatted_unit = UNIT_SHORTHANDS.get(reduced_unit, reduced_unit)
+
+    return f"{reduced_value:.2f}{formatted_unit}"
+
+
+# Performance tests that we don't want to alarm on.
 IGNORED = [
-    # Network throughput on m6a.metal
-    {"instance": "m6a.metal", "performance_test": "test_network_tcp_throughput"},
-    # Network throughput on m7a.metal
-    {"instance": "m7a.metal-48xl", "performance_test": "test_network_tcp_throughput"},
     # block latencies if guest uses async request submission
     {"fio_engine": "libaio", "metric": "clat_read"},
     {"fio_engine": "libaio", "metric": "clat_write"},
     # boot time metrics
     {"performance_test": "test_boottime", "metric": "resume_time"},
-    # block throughput on m8g
-    {"fio_engine": "libaio", "vcpus": "2", "instance": "m8g.metal-24xl"},
-    {"fio_engine": "libaio", "vcpus": "2", "instance": "m8g.metal-48xl"},
+    # memory hotplug metrics: ignore api_time and fc_time metrics, keeping only total_time.
+    *[
+        {
+            "performance_test": "test_memory_hotplug_latency",
+            "metric": f"{prefix}_{metric}",
+        }
+        for prefix in ["hotplug", "hotunplug", "hotplug_2nd"]
+        for metric in ["api_time", "fc_time"]
+    ],
 ]
 
 
@@ -69,106 +146,37 @@ def is_ignored(dimensions) -> bool:
     return False
 
 
-def extract_dimensions(emf):
-    """Extracts the cloudwatch dimensions from an EMF log message"""
-    if not emf["_aws"]["CloudWatchMetrics"][0]["Dimensions"]:
-        # Skipped tests emit a duration metric, but have no dimensions set
-        return {}
+def load_data_series(data_path: Path):
+    """Recursively collects `metrics.json` files in provided path"""
+    data = {}
+    for name in glob.glob(f"{data_path}/**/metrics.json", recursive=True):
+        with open(name, encoding="utf-8") as f:
+            j = json.load(f)
 
-    dimension_list = [
-        dim
-        for dimensions in emf["_aws"]["CloudWatchMetrics"][0]["Dimensions"]
-        for dim in dimensions
-    ]
-    return {key: emf[key] for key in emf if key in dimension_list}
+        metrics = j["metrics"]
+        dimentions = frozenset(j["dimensions"].items())
+
+        data[dimentions] = {}
+        for m in metrics:
+            # Ignore certain metrics as we know them to be volatile
+            if "cpu_utilization" in m:
+                continue
+            mm = metrics[m]
+            unit = mm["unit"]
+            values = mm["values"]
+            data[dimentions][m] = (values, unit)
+
+    return data
 
 
-def process_log_entry(emf: dict):
-    """Parses the given EMF log entry
-
-    Returns the entries dimensions and its list-valued properties/metrics, together with their units
+def uninteresting_dimensions(data):
     """
-    result = {
-        key: (value, find_unit(emf, key))
-        for key, value in emf.items()
-        if (
-            "fc_metrics" not in key
-            and "cpu_utilization" not in key
-            and isinstance(value, list)
-        )
-    }
-    # Since we don't consider metrics having fc_metrics in key
-    # result could be empty so, return empty dimensions as well
-    if not result:
-        return {}, {}
-
-    return extract_dimensions(emf), result
-
-
-def find_unit(emf: dict, metric: str):
-    """Determines the unit of the given metric"""
-    metrics = {
-        y["Name"]: y["Unit"] for y in emf["_aws"]["CloudWatchMetrics"][0]["Metrics"]
-    }
-    return metrics.get(metric, "None")
-
-
-def load_data_series(report_path: Path, tag=None, *, reemit: bool = False):
-    """Loads the data series relevant for A/B-testing from test_results/test-report.json
-    into a dictionary mapping each message's cloudwatch dimensions to a dictionary of
-    its list-valued properties/metrics.
-
-    If `reemit` is True, it also reemits all EMF logs to a local EMF agent,
-    overwriting the attached "git_commit_id" field with the given revision."""
-    # Dictionary mapping EMF dimensions to A/B-testable metrics/properties
-    processed_emf = {}
-
-    report = json.loads(report_path.read_text("UTF-8"))
-    for test in report["tests"]:
-        for line in test["teardown"]["stdout"].splitlines():
-            # Only look at EMF log messages. If we ever have other stdout that starts with braces,
-            # we will need to rethink this heuristic.
-            if line.startswith("{"):
-                emf = json.loads(line)
-
-                if reemit:
-                    assert tag is not None
-
-                    emf["git_commit_id"] = str(tag)
-                    emit_raw_emf(emf)
-
-                dimensions, result = process_log_entry(emf)
-
-                if not dimensions:
-                    continue
-
-                dimension_set = frozenset(dimensions.items())
-
-                if dimension_set not in processed_emf:
-                    processed_emf[dimension_set] = result
-                else:
-                    # If there are many data points for a metric, they will be split across
-                    # multiple EMF log messages. We need to reassemble :(
-                    assert (
-                        processed_emf[dimension_set].keys() == result.keys()
-                    ), f"Found incompatible metrics associated with dimension set {dimension_set}: {processed_emf[dimension_set].keys()} in one EMF message, but {result.keys()} in another."
-
-                    for metric, (values, unit) in processed_emf[dimension_set].items():
-                        assert result[metric][1] == unit
-
-                        values.extend(result[metric][0])
-
-    return processed_emf
-
-
-def uninteresting_dimensions(processed_emf):
-    """
-    Computes the set of cloudwatch dimensions that only ever take on a
+    Computes the set of dimensions that only ever take on a
     single value across the entire dataset.
     """
     values_per_dimension = defaultdict(set)
 
-    for dimension_set in processed_emf:
+    for dimension_set in data:
         for dimension, value in dimension_set:
             values_per_dimension[dimension].add(value)
 
@@ -181,35 +189,103 @@ def uninteresting_dimensions(processed_emf):
     return uninteresting
 
 
-def collect_data(tag: str, binary_dir: Path, pytest_opts: str):
+def collect_data(
+    tag: str,
+    binary_dir: Path,
+    artifacts: Optional[Path],
+    pytest_opts: str,
+    iteration: int = 0,
+):
     """
     Executes the specified test using the provided firecracker binaries and
-    stores results into the `test_results/tag` directory
+    stores results into the `test_results/tag/iteration` directory
     """
     binary_dir = binary_dir.resolve()
 
-    print(f"Collecting samples with {binary_dir}")
-    test_report_path = f"test_results/{tag}/test-report.json"
+    print(
+        f"Collecting samples | binaries path: {binary_dir}"
+        + f" | artifacts path: {artifacts}"
+        if artifacts
+        else ""
+    )
+    test_path = f"test_results/{tag}/{iteration}"
+    test_report_path = f"{test_path}/test-report.json"
+
+    # Cleaning the report directory, to ensure we start from a clean state.
+    shutil.rmtree(test_path, ignore_errors=True)
+
+    # It is not possible to just download them here this script is usually run inside docker
+    # and artifacts downloading does not work inside it.
+    if artifacts:
+        subprocess.run(
+            f"./tools/devtool set_current_artifacts {artifacts}", check=True, shell=True
+        )
+
     subprocess.run(
         f"./tools/test.sh --binary-dir={binary_dir} {pytest_opts} -m '' --json-report-file=../{test_report_path}",
-        env=os.environ
-        | {
-            "AWS_EMF_ENVIRONMENT": "local",
-            "AWS_EMF_NAMESPACE": "local",
-        },
+        env=os.environ,
         check=True,
         shell=True,
     )
 
-    return load_data_series(Path(test_report_path), binary_dir, reemit=True)
+    return load_data_series(Path(test_path))
+
+
+def check_regression(
+    a_samples: List[float], b_samples: List[float], *, n_resamples: int = 9999
+):
+    """Checks for a regression by performing a permutation test. A permutation test is a non-parametric test that takes
+    three parameters: Two populations (sets of samples) and a function computing a "statistic" based on two populations.
+    First, the test computes the statistic for the initial populations. It then randomly
+    permutes the two populations (e.g. merges them and then randomly splits them again). For each such permuted
+    population, the statistic is computed. Then, all the statistics are sorted, and the percentile of the statistic for the
+    initial populations is computed. We then look at the fraction of statistics that are larger/smaller than that of the
+    initial populations. The minimum of these two fractions will then become the p-value.
+
+    The idea is that if the two populations are indeed drawn from the same distribution (e.g. if performance did not
+    change), then permuting will not affect the statistic (indeed, it should be approximately normal-distributed, and
+    the statistic for the initial populations will be somewhere "in the middle").
+
+    Useful for performance tests.
+    """
+    return scipy.stats.permutation_test(
+        (a_samples, b_samples),
+        # Compute the difference of means, such that a positive different indicates potential for regression.
+        lambda x, y, axis: numpy.mean(y, axis=axis) - numpy.mean(x, axis=axis),
+        n_resamples=n_resamples,
+    )
+
+
+@dataclass
+class Threshold:
+    """A threshold value with optional per-metric overrides."""
+
+    default: float
+    overrides: Dict[str, float] = field(default_factory=dict)
+
+    def get(self, metric: str) -> float:
+        """Returns the threshold to use for a specific metric"""
+        return self.overrides.get(metric, self.default)
+
+    @classmethod
+    def from_args(cls, args, default: float):
+        """Parse a list like ["0.05", "restore_latency=0.1"] into a Threshold."""
+        overrides = {}
+        for arg in args:
+            if "=" in arg:
+                name, val = arg.rsplit("=", 1)
+                overrides[name] = float(val)
+            else:
+                default = float(arg)
+        return cls(default=default, overrides=overrides)
 
 
 def analyze_data(
-    processed_emf_a,
-    processed_emf_b,
-    p_thresh,
-    strength_abs_thresh,
-    noise_threshold,
+    data_a,
+    data_b,
+    p_thresh: Threshold,
+    strength_abs_thresh: Threshold,
+    noise_threshold: Threshold,
     *,
     n_resamples: int = 9999,
 ):
@@ -217,22 +293,18 @@ def analyze_data(
     Analyzes the A/B-test data produced by `collect_data`, by performing regression tests
     as described this script's doc-comment.
 
-    Returns a mapping of dimensions and properties/metrics to the result of their regression test.
+    Returns the list of error messages (empty if the test passes).
     """
-    assert set(processed_emf_a.keys()) == set(
-        processed_emf_b.keys()
+    assert set(data_a.keys()) == set(
+        data_b.keys()
     ), "A and B run produced incomparable data. This is a bug in the test!"
 
     results = {}
 
-    metrics_logger = get_metrics_logger()
-
-    for prop_name, prop_val in global_props.__dict__.items():
-        metrics_logger.set_property(prop_name, prop_val)
-
-    for dimension_set in processed_emf_a:
-        metrics_a = processed_emf_a[dimension_set]
-        metrics_b = processed_emf_b[dimension_set]
+    t0 = time.perf_counter()
+    for dimension_set in data_a:
+        metrics_a = data_a[dimension_set]
+        metrics_b = data_b[dimension_set]
 
         assert set(metrics_a.keys()) == set(
             metrics_b.keys()
@@ -242,15 +314,15 @@ def analyze_data(
             result = check_regression(
                 values_a, metrics_b[metric][0], n_resamples=n_resamples
             )
-
-            metrics_logger.set_dimensions({"metric": metric, **dict(dimension_set)})
-            metrics_logger.put_metric("p_value", float(result.pvalue), "None")
-            metrics_logger.put_metric("mean_difference", float(result.statistic), unit)
-            metrics_logger.set_property("data_a", values_a)
-            metrics_logger.set_property("data_b", metrics_b[metric][0])
-            metrics_logger.flush()
-
             results[dimension_set, metric] = (result, unit)
+
+    print(f"Regression tests took {time.perf_counter() - t0:.2f}s")
+
+    # Validate that all per-metric overrides refer to metrics that exist in the dataset
+    all_metrics = {metric for _, metric in results}
+    for thresh in (p_thresh, strength_abs_thresh, noise_threshold):
+        unknown = set(thresh.overrides) - all_metrics
+        assert not unknown, f"Per-metric overrides refer to unknown metrics: {unknown}"
 
     # We sort our A/B-Testing results keyed by metric here. The resulting lists of values
     # will be approximately normal distributed, and we will use this property as a means of error correction.
@@ -296,33 +368,35 @@ def analyze_data(
 
         print(f"Doing A/B-test for dimensions {dimension_set} and property {metric}")
 
-        values_a = processed_emf_a[dimension_set][metric][0]
-        baseline_mean = statistics.mean(values_a)
+        values_a = data_a[dimension_set][metric][0]
+        baseline_mean = numpy.mean(values_a)
 
         relative_changes_by_metric[metric].append(result.statistic / baseline_mean)
 
-        if result.pvalue < p_thresh and abs(result.statistic) > strength_abs_thresh:
+        if result.pvalue < p_thresh.get(metric) and abs(
+            result.statistic
+        ) > strength_abs_thresh.get(metric):
             failures.append((dimension_set, metric, result, unit))
 
             relative_changes_significant[metric].append(
                 result.statistic / baseline_mean
             )
 
-    messages = []
-    do_not_print_list = uninteresting_dimensions(processed_emf_a)
+    error_messages = []
+    do_not_print_list = uninteresting_dimensions(data_a)
     for dimension_set, metric, result, unit in failures:
-        # Sanity check as described above
-        if abs(statistics.mean(relative_changes_by_metric[metric])) <= noise_threshold:
-            continue
-
         # No data points for this metric were deemed significant
         if metric not in relative_changes_significant:
             continue
 
-        # The significant data points themselves are above the noise threshold
-        if abs(statistics.mean(relative_changes_significant[metric])) > noise_threshold:
-            old_mean = statistics.mean(processed_emf_a[dimension_set][metric][0])
-            new_mean = statistics.mean(processed_emf_b[dimension_set][metric][0])
+        relative_change = numpy.mean(relative_changes_by_metric[metric])
+        relative_change_significant = numpy.mean(relative_changes_significant[metric])
+        # Sanity check as described above
+        if abs(relative_change) > noise_threshold.get(metric) and abs(
+            relative_change_significant
+        ) > noise_threshold.get(metric):
+            old_mean = numpy.mean(data_a[dimension_set][metric][0])
+            new_mean = numpy.mean(data_b[dimension_set][metric][0])
 
             msg = (
                 f"\033[0;32m[Firecracker A/B-Test Runner]\033[0m A/B-testing shows a change of "
@@ -333,38 +407,77 @@ def analyze_data(
                 f"characteristics did not change across the tested commits, has a probability of {result.pvalue:.2%}. "
                 f"Tested Dimensions:\n{json.dumps({k: v for k, v in dimension_set if k not in do_not_print_list}, indent=2, sort_keys=True)}"
             )
-            messages.append(msg)
+            error_messages.append(msg)
 
-    assert not messages, "\n" + "\n".join(messages)
-    print("No regressions detected!")
+    return error_messages
+
+
+def merge_data(accumulated, new_data):
+    """Merge new_data into accumulated by appending values lists for each metric."""
+    for dimension_set, metrics in new_data.items():
+        if dimension_set not in accumulated:
+            accumulated[dimension_set] = {}
+        for metric, (values, unit) in metrics.items():
+            if metric in accumulated[dimension_set]:
+                accumulated[dimension_set][metric][0].extend(values)
+            else:
+                accumulated[dimension_set][metric] = (list(values), unit)
 
 
 def ab_performance_test(
-    a_revision: Path,
-    b_revision: Path,
+    a_directory: Path,
+    b_directory: Path,
+    a_artifacts: Optional[Path],
+    b_artifacts: Optional[Path],
     pytest_opts,
-    p_thresh,
-    strength_abs_thresh,
-    noise_threshold,
+    p_thresh: Threshold,
+    strength_abs_thresh: Threshold,
+    noise_threshold: Threshold,
+    max_iterations=1,
 ):
-    """Does an A/B-test of the specified test with the given firecracker/jailer binaries"""
+    """Does an A/B-test of the specified test with the given firecracker/jailer binaries.
 
-    return binary_ab_test(
-        lambda bin_dir, is_a: collect_data(is_a and "A" or "B", bin_dir, pytest_opts),
-        lambda ah, be: analyze_data(
-            ah,
-            be,
+    Retries up to max_iterations times, accumulating data only for dimensions
+    that are still failing, to reduce noise-induced false positives."""
+
+    data_a = {}
+    data_b = {}
+    error_messages = []
+
+    for i in range(max_iterations):
+        print(f"\n=== Iteration {i + 1}/{max_iterations} ===")
+        # Changing the order or A and B executions across iterations, to avoid fluctuations caused by execution order
+        if i % 2 == 0:
+            new_a = collect_data("A", a_directory, a_artifacts, pytest_opts, i)
+            new_b = collect_data("B", b_directory, b_artifacts, pytest_opts, i)
+        else:
+            new_b = collect_data("B", b_directory, b_artifacts, pytest_opts, i)
+            new_a = collect_data("A", a_directory, a_artifacts, pytest_opts, i)
+        merge_data(data_a, new_a)
+        merge_data(data_b, new_b)
+
+        error_messages = analyze_data(
+            data_a,
+            data_b,
             p_thresh,
             strength_abs_thresh,
             noise_threshold,
-            n_resamples=int(100 / p_thresh),
-        ),
-        a_directory=a_revision,
-        b_directory=b_revision,
-    )
+        )
+
+        if not error_messages:
+            print("No regressions detected!")
+            return
+
+        if i < max_iterations - 1:
+            print(
+                f"{len(error_messages)} regression(s) detected, retrying to collect more data..."
+            )
+
+    assert not error_messages, "\n" + "\n".join(error_messages)
 
 
-if __name__ == "__main__":
+def main():
+    """The main function when invoking the script"""
     parser = argparse.ArgumentParser(
         description="Executes Firecracker's A/B testsuite across the specified commits"
     )
@@ -374,71 +487,114 @@ if __name__ == "__main__":
         help="Run an specific test of our test suite as an A/B-test across two specified commits",
     )
     run_parser.add_argument(
-        "a_revision",
+        "--binaries-a",
         help="Directory containing firecracker and jailer binaries to be considered the performance baseline",
         type=Path,
+        required=True,
     )
     run_parser.add_argument(
-        "b_revision",
-        help="Directory containing firecracker and jailer binaries whose performance we want to compare against the results from a_revision",
+        "--binaries-b",
+        help="Directory containing firecracker and jailer binaries whose performance we want to compare against the results from binaries-a",
         type=Path,
+        required=True,
+    )
+    run_parser.add_argument(
+        "--artifacts-a",
+        help="Name of the artifacts directory in the build/artifacts to use for revision A test. If the directory does not exist, the name will be treated as S3 path and artifacts will be downloaded from there.",
+        # Type is string since it can be an s3 path which if passed to `Path` constructor
+        # will be incorrectly modified
+        type=str,
+        required=False,
+    )
+    run_parser.add_argument(
+        "--artifacts-b",
+        help="Name of the artifacts directory in the build/artifacts to use for revision B test. If the directory does not exist, the name will be treated as S3 path and artifacts will be downloaded from there.",
+        # Type is string since it can be an s3 path which if passed to `Path` constructor
+        # will be incorrectly modified
+        type=str,
+        required=False,
     )
     run_parser.add_argument(
         "--pytest-opts",
         help="Parameters to pass through to pytest, for example for test selection",
         required=True,
     )
+    run_parser.add_argument(
+        "--max-iterations",
+        help="Maximum number of A/B iterations. Retries only if regressions are detected, accumulating more data to reduce false positives.",
+        type=int,
+        default=1,
+    )
     analyze_parser = subparsers.add_parser(
         "analyze",
         help="Analyze the results of two manually ran tests based on their test-report.json files",
     )
     analyze_parser.add_argument(
-        "report_a",
-        help="The path to the test-report.json file of the baseline run",
+        "path_a",
+        help="The path to the directory with A run",
         type=Path,
     )
     analyze_parser.add_argument(
-        "report_b",
-        help="The path to the test-report.json file of the run whose performance we want to compare against report_a",
+        "path_b",
+        help="The path to the directory with B run",
         type=Path,
     )
     parser.add_argument(
         "--significance",
-        help="The p-value threshold that needs to be crossed for a test result to be considered significant",
-        type=float,
-        default=0.01,
+        help="The p-value threshold. Pass a float for the global default, or metric=float for a per-metric override. Repeatable.",
+        action="append",
+        default=[],
     )
     parser.add_argument(
         "--absolute-strength",
-        help="The minimum absolute delta required before a regression will be considered valid",
-        type=float,
-        default=0.0,
+        help="The minimum absolute delta. Pass a float for the global default, or metric=float for a per-metric override. Repeatable.",
+        action="append",
+        default=[],
     )
     parser.add_argument(
         "--noise-threshold",
-        help="The minimal delta which a metric has to regress on average across all tests that emit it before the regressions will be considered valid.",
-        type=float,
-        default=0.05,
+        help="The minimal average relative delta. Pass a float for the global default, or metric=float for a per-metric override. Repeatable.",
+        action="append",
+        default=[],
     )
     args = parser.parse_args()
 
-    if args.command == "run":
-        ab_performance_test(
-            args.a_revision,
-            args.b_revision,
-            args.pytest_opts,
-            args.significance,
-            args.absolute_strength,
-            args.noise_threshold,
-        )
-    else:
-        data_a = load_data_series(args.report_a)
-        data_b = load_data_series(args.report_b)
+    p_thresh = Threshold.from_args(args.significance, 0.01)
+    strength_abs_thresh = Threshold.from_args(args.absolute_strength, 0.0)
+    noise_threshold = Threshold.from_args(args.noise_threshold, 0.05)
 
-        analyze_data(
+    if args.command == "run":
+        t0 = time.perf_counter()
+        ab_performance_test(
+            args.binaries_a,
+            args.binaries_b,
+            args.artifacts_a,
+            args.artifacts_b,
+            args.pytest_opts,
+            p_thresh,
+            strength_abs_thresh,
+            noise_threshold,
+            max_iterations=args.max_iterations,
+        )
+        print(f"Total A/B test took {time.perf_counter() - t0:.2f}s")
+    else:
+        t0 = time.perf_counter()
+        data_a = load_data_series(args.path_a)
+        data_b = load_data_series(args.path_b)
+        print(f"Data loading took {time.perf_counter() - t0:.2f}s")
+
+        t0 = time.perf_counter()
+        error_messages = analyze_data(
             data_a,
             data_b,
-            args.significance,
-            args.absolute_strength,
-            args.noise_threshold,
+            p_thresh,
+            strength_abs_thresh,
+            noise_threshold,
         )
+        print(f"Analysis took {time.perf_counter() - t0:.2f}s")
+        assert not error_messages, "\n" + "\n".join(error_messages)
+        print("No regressions detected!")
+
+
+if __name__ == "__main__":
+    main()

@@ -7,7 +7,7 @@ import platform
 from pathlib import Path
 
 from framework import defs, utils
-from framework.defs import DEFAULT_BINARY_DIR
+from framework.defs import DEFAULT_BINARY_DIR, LOCAL_BUILD_PATH
 from framework.with_filelock import with_filelock
 
 DEFAULT_TARGET = f"{platform.machine()}-unknown-linux-musl"
@@ -27,6 +27,7 @@ def cargo(
     env: dict = None,
     cwd: str = None,
     nightly: bool = False,
+    timeout: int = None,
 ):
     """Executes the specified cargo subcommand"""
     toolchain = f"+{nightly_toolchain()}" if nightly else ""
@@ -35,7 +36,7 @@ def cargo(
     cmd = (
         f"{env_string} cargo {toolchain} {subcommand} {cargo_args} -- {subcommand_args}"
     )
-    return utils.check_output(cmd, cwd=cwd)
+    return utils.check_output(cmd, cwd=cwd, timeout=timeout)
 
 
 def get_rustflags():
@@ -50,10 +51,18 @@ def cargo_test(path, extra_args=""):
     env = {
         "CARGO_TARGET_DIR": os.path.join(path, "unit-tests"),
         "RUST_TEST_THREADS": 1,
-        "RUST_BACKTRACE": 1,
+        "RUST_BACKTRACE": "1",
         "RUSTFLAGS": get_rustflags(),
     }
-    cargo("test", extra_args + " --all --no-fail-fast", env=env)
+    cargo(
+        "test",
+        extra_args + " --all --no-fail-fast",
+        subcommand_args="--nocapture",
+        env=env,
+        # Kill cargo test 60s before pytest's 600s timeout, so pytest can report
+        # the failure and upload artifacts cleanly instead of being killed itself.
+        timeout=540,
+    )
 
 
 def get_binary(name, *, binary_dir=DEFAULT_BINARY_DIR, example=None):
@@ -69,7 +78,13 @@ def get_example(name, *args, package="firecracker", **kwargs):
     return get_binary(package, *args, **kwargs, example=name)
 
 
-def run_seccompiler_bin(bpf_path, json_path=defs.SECCOMP_JSON_DIR, basic=False):
+def run_seccompiler_bin(
+    bpf_path,
+    json_path=defs.SECCOMP_JSON_DIR,
+    basic=False,
+    split_output=False,
+    binary_dir=DEFAULT_BINARY_DIR,
+):
     """
     Run seccompiler-bin.
 
@@ -85,11 +100,14 @@ def run_seccompiler_bin(bpf_path, json_path=defs.SECCOMP_JSON_DIR, basic=False):
     if basic:
         seccompiler_args += " --basic"
 
-    seccompiler = get_binary("seccompiler-bin")
+    if split_output:
+        seccompiler_args += " --split-output"
+
+    seccompiler = get_binary("seccompiler-bin", binary_dir=binary_dir)
     utils.check_output(f"{seccompiler} {seccompiler_args}")
 
 
-def run_snap_editor_rebase(base_snap, diff_snap):
+def run_snap_editor_rebase(base_snap, diff_snap, binary_dir=DEFAULT_BINARY_DIR):
     """
     Run apply_diff_snap.
 
@@ -97,7 +115,7 @@ def run_snap_editor_rebase(base_snap, diff_snap):
     :param diff_snap: path to diff snapshot mem file
     """
 
-    snap_ed = get_binary("snapshot-editor")
+    snap_ed = get_binary("snapshot-editor", binary_dir=binary_dir)
     utils.check_output(
         f"{snap_ed} edit-memory rebase --memory-path {base_snap} --diff-path {diff_snap}"
     )
@@ -121,3 +139,29 @@ def gcc_compile(src_file, output_file, extra_flags="-static -O3"):
     if not output_file.exists():
         compile_cmd = f"gcc {src_file} -o {output_file} {extra_flags}"
         utils.check_output(compile_cmd)
+
+
+def build_gdb():
+    """Builds Firecracker with GDB feature enabled. Returns the binary dir"""
+    build_path = LOCAL_BUILD_PATH / "gdb"
+    cargo(
+        "build",
+        f"--features gdb --target {DEFAULT_TARGET} --all",
+        env={"CARGO_TARGET_DIR": build_path},
+    )
+
+    return build_path / DEFAULT_TARGET / "debug"
+
+
+def build_fuzzing(release=False):
+    """Builds Firecracker with fuzzing feature enabled. Returns the binary dir"""
+    profile = "release" if release else "debug"
+    build_path = LOCAL_BUILD_PATH / "fuzzing"
+    release_flag = " --release" if release else ""
+    cargo(
+        "build",
+        f"--features fuzzing{release_flag} --target {DEFAULT_TARGET} --all",
+        env={"CARGO_TARGET_DIR": build_path},
+    )
+
+    return build_path / DEFAULT_TARGET / profile

@@ -36,8 +36,9 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
-use crate::vstate::memory;
-use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
+use crate::vstate::memory::{
+    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
@@ -65,6 +66,19 @@ impl From<&VmResources> for VmInfo {
             cpu_template: StaticCpuTemplate::from(&value.machine_config.cpu_template),
             boot_source: value.boot_source.config.clone(),
             huge_pages: value.machine_config.huge_pages,
+        }
+    }
+}
+
+impl From<&Vmm> for VmInfo {
+    fn from(value: &Vmm) -> Self {
+        let machine_config = &value.machine_config;
+        Self {
+            mem_size_mib: machine_config.mem_size_mib as u64,
+            smt: machine_config.smt,
+            cpu_template: StaticCpuTemplate::from(&machine_config.cpu_template),
+            boot_source: value.boot_source_config.clone(),
+            huge_pages: machine_config.huge_pages,
         }
     }
 }
@@ -119,8 +133,8 @@ pub enum MicrovmStateError {
     RestoreDevices(#[from] DevicePersistError),
     /// Cannot save Vcpu state: {0}
     SaveVcpuState(vstate::vcpu::VcpuError),
-    /// Cannot save Vm state: {0}
-    SaveVmState(vstate::vm::ArchVmError),
+    /// Cannot save KvmVm state: {0}
+    SaveVmState(vstate::vm::KvmVmError),
     /// Cannot signal Vcpu: {0}
     SignalVcpu(VcpuSendEventError),
     /// Vcpu is in unexpected state.
@@ -146,7 +160,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(8, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(10, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -160,14 +174,18 @@ pub fn create_snapshot(
 
     snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
 
-    vmm.vm
-        .snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+        CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+            "snapshot requires KVM".into(),
+        ))
+    })?;
+    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
     // for queue objects.
     vmm.device_manager
-        .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
+        .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
     Ok(())
 }
@@ -268,17 +286,46 @@ pub fn validate_cpu_manufacturer_id(microvm_state: &MicrovmState) {
 pub enum SnapShotStateSanityCheckError {
     /// No memory region defined.
     NoMemory,
+    /// No DRAM memory region defined.
+    NoDramMemory,
+    /// DRAM memory has more than a single slot.
+    DramMemoryTooManySlots,
+    /// DRAM memory is unplugged.
+    DramMemoryUnplugged,
 }
 
 /// Performs sanity checks against the state file and returns specific errors.
 pub fn snapshot_state_sanity_check(
     microvm_state: &MicrovmState,
 ) -> Result<(), SnapShotStateSanityCheckError> {
-    // Check if the snapshot contains at least 1 mem region.
+    // Check that the snapshot contains at least 1 mem region, that at least one is Dram,
+    // and that Dram region contains a single plugged slot.
     // Upper bound check will be done when creating guest memory by comparing against
     // KVM max supported value kvm_context.max_memslots().
-    if microvm_state.vm_state.memory.regions.is_empty() {
+    let regions = &microvm_state.vm_state.memory.regions;
+
+    if regions.is_empty() {
         return Err(SnapShotStateSanityCheckError::NoMemory);
+    }
+
+    if !regions
+        .iter()
+        .any(|r| r.region_type == GuestRegionType::Dram)
+    {
+        return Err(SnapShotStateSanityCheckError::NoDramMemory);
+    }
+
+    for dram_region in regions
+        .iter()
+        .filter(|r| r.region_type == GuestRegionType::Dram)
+    {
+        if dram_region.plugged.len() != 1 {
+            return Err(SnapShotStateSanityCheckError::DramMemoryTooManySlots);
+        }
+
+        if !dram_region.plugged[0] {
+            return Err(SnapShotStateSanityCheckError::DramMemoryUnplugged);
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -339,6 +386,32 @@ pub fn restore_from_snapshot(
             .map(|device_state| device_state.tap_if_name.clone_from(&entry.host_dev_name))
             .ok_or(SnapshotStateFromFileError::UnknownNetworkDevice)?;
     }
+
+    if let Some(vsock_override) = &params.vsock_override {
+        // There should only ever be at most one vsock device, therefore this
+        // should correctly find it and modify the path if such a device exists.
+        let device_state = microvm_state
+            .device_states
+            .mmio_state
+            .vsock_device
+            .as_mut()
+            .map(|device| &mut device.device_state)
+            .or_else(|| {
+                microvm_state
+                    .device_states
+                    .pci_state
+                    .vsock_device
+                    .as_mut()
+                    .map(|device| &mut device.device_state)
+            })
+            .ok_or(SnapshotStateFromFileError::UnknownVsockDevice)?;
+
+        device_state
+            .backend
+            .uds_path
+            .clone_from(&vsock_override.uds_path);
+    }
+
     let track_dirty_pages = params.track_dirty_pages;
 
     let vcpu_count = microvm_state
@@ -397,6 +470,7 @@ pub fn restore_from_snapshot(
         uffd,
         seccomp_filters,
         vm_resources,
+        params.clock_realtime,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
@@ -410,6 +484,8 @@ pub enum SnapshotStateFromFileError {
     Load(#[from] crate::snapshot::SnapshotError),
     /// Unknown Network Device.
     UnknownNetworkDevice,
+    /// Unknown Vsock Device.
+    UnknownVsockDevice,
 }
 
 fn snapshot_state_from_file(
@@ -576,6 +652,8 @@ mod tests {
     use super::*;
     use crate::Vmm;
     #[cfg(target_arch = "x86_64")]
+    use crate::builder::tests::insert_vmclock_device;
+    #[cfg(target_arch = "x86_64")]
     use crate::builder::tests::insert_vmgenid_device;
     use crate::builder::tests::{
         CustomBlockConfig, default_kernel_cmdline, default_vmm, insert_balloon_device,
@@ -588,7 +666,7 @@ mod tests {
     use crate::vmm_config::balloon::BalloonDeviceConfig;
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
-    use crate::vstate::memory::GuestMemoryRegionState;
+    use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");
@@ -600,6 +678,8 @@ mod tests {
             amount_mib: 0,
             deflate_on_oom: false,
             stats_polling_interval_s: 0,
+            free_page_hinting: false,
+            free_page_reporting: false,
         };
         insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_config);
 
@@ -619,6 +699,7 @@ mod tests {
             iface_id: String::from("netif"),
             host_dev_name: String::from("hostname"),
             guest_mac: None,
+            mtu: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
         };
@@ -638,6 +719,8 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         insert_vmgenid_device(&mut vmm);
+        #[cfg(target_arch = "x86_64")]
+        insert_vmclock_device(&mut vmm);
 
         vmm
     }
@@ -666,19 +749,14 @@ mod tests {
                 ..Default::default()
             },
             #[cfg(target_arch = "aarch64")]
-            vm_state: vmm.vm.save_state(&mpidrs).unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state(&mpidrs).unwrap(),
             #[cfg(target_arch = "x86_64")]
-            vm_state: vmm.vm.save_state().unwrap(),
+            vm_state: vmm.vm.as_kvm().unwrap().save_state().unwrap(),
         };
 
-        let mut buf = vec![0; 10000];
-        Snapshot::new(&microvm_state)
-            .save(&mut buf.as_mut_slice())
-            .unwrap();
+        let serialized_data = bitcode::serialize(&microvm_state).unwrap();
 
-        let restored_microvm_state: MicrovmState = Snapshot::load_without_crc_check(buf.as_slice())
-            .unwrap()
-            .data;
+        let restored_microvm_state: MicrovmState = bitcode::deserialize(&serialized_data).unwrap();
 
         assert_eq!(restored_microvm_state.vm_info, microvm_state.vm_info);
         assert_eq!(
@@ -693,6 +771,8 @@ mod tests {
             regions: vec![GuestMemoryRegionState {
                 base_address: 0,
                 size: 0x20000,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
             }],
         };
 

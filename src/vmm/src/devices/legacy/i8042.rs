@@ -9,11 +9,11 @@ use std::io;
 use std::num::Wrapping;
 use std::sync::{Arc, Barrier};
 
-use log::warn;
 use serde::Serialize;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::logger::{IncMetric, SharedIncMetric, error};
+use crate::logger::{IncMetric, SharedIncMetric, error, warn};
+use crate::vstate::bus::BusDevice;
 
 /// Errors thrown by the i8042 device.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -210,7 +210,7 @@ impl I8042Device {
     }
 }
 
-impl vm_device::BusDevice for I8042Device {
+impl BusDevice for I8042Device {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         // All our ports are byte-wide. We don't know how to handle any wider data.
         if data.len() != 1 {
@@ -342,7 +342,6 @@ impl vm_device::BusDevice for I8042Device {
 
 #[cfg(test)]
 mod tests {
-    use vm_device::BusDevice;
 
     use super::*;
 

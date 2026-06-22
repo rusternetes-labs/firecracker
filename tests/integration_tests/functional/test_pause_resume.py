@@ -8,12 +8,13 @@ from subprocess import TimeoutExpired
 
 import pytest
 
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
+
 
 def verify_net_emulation_paused(metrics):
     """Verify net emulation is paused based on provided metrics."""
     net_metrics = metrics["net"]
     assert net_metrics["rx_queue_event_count"] == 0
-    assert net_metrics["rx_partial_writes"] == 0
     assert net_metrics["rx_tap_event_count"] == 0
     assert net_metrics["rx_bytes_count"] == 0
     assert net_metrics["rx_packets_count"] == 0
@@ -29,11 +30,12 @@ def verify_net_emulation_paused(metrics):
     print(net_metrics)
 
 
-def test_pause_resume(uvm_nano):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_pause_resume(uvm_configured):
     """
     Test scenario: boot/pause/resume.
     """
-    microvm = uvm_nano
+    microvm = uvm_configured
     microvm.add_net_iface()
 
     # Pausing the microVM before being started is not allowed.
@@ -79,11 +81,12 @@ def test_pause_resume(uvm_nano):
     microvm.kill()
 
 
-def test_describe_instance(uvm_nano):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_describe_instance(uvm_configured):
     """
     Test scenario: DescribeInstance different states.
     """
-    microvm = uvm_nano
+    microvm = uvm_configured
 
     # Check MicroVM state is "Not started"
     response = microvm.api.describe.get()
@@ -113,11 +116,12 @@ def test_describe_instance(uvm_nano):
     microvm.kill()
 
 
-def test_pause_resume_preboot(uvm_nano):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_pause_resume_preboot(uvm_configured):
     """
     Test pause/resume operations are not allowed pre-boot.
     """
-    basevm = uvm_nano
+    basevm = uvm_configured
 
     expected_err = "not supported before starting the microVM"
 
@@ -133,12 +137,12 @@ def test_pause_resume_preboot(uvm_nano):
 @pytest.mark.skipif(
     platform.machine() != "x86_64", reason="Only x86_64 supports pvclocks."
 )
-def test_kvmclock_ctrl(uvm_plain_any):
+def test_kvmclock_ctrl(uvm):
     """
     Test that pausing vCPUs does not trigger a soft lock-up
     """
 
-    microvm = uvm_plain_any
+    microvm = uvm
     microvm.help.enable_console()
     microvm.spawn()
 

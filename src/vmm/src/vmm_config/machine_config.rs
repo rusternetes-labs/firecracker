@@ -29,8 +29,6 @@ pub enum MachineConfigError {
     SmtNotSupported,
     /// Could not determine host kernel version when checking hugetlbfs compatibility
     KernelVersion,
-    /// Firecracker's huge pages support is incompatible with memory ballooning.
-    BalloonAndHugePages,
 }
 
 /// Describes the possible (huge)page configurations for a microVM's memory.
@@ -54,7 +52,7 @@ impl HugePageConfig {
             HugePageConfig::Hugetlbfs2M => 2,
         };
 
-        mem_size_mib % divisor == 0
+        mem_size_mib.is_multiple_of(divisor)
     }
 
     /// Returns the flags required to pass to `mmap`, in addition to `MAP_ANONYMOUS`, to

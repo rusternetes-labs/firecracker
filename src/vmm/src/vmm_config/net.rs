@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::RateLimiterConfig;
 use crate::VmmError;
+use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::net::{Net, TapError};
 use crate::utils::net::mac::MacAddr;
 
@@ -23,6 +24,8 @@ pub struct NetworkInterfaceConfig {
     pub host_dev_name: String,
     /// Guest MAC address.
     pub guest_mac: Option<MacAddr>,
+    /// Maximum Transmission Unit to advertise to the guest via VIRTIO_NET_F_MTU.
+    pub mtu: Option<u16>,
     /// Rate Limiter for received packages.
     pub rx_rate_limiter: Option<RateLimiterConfig>,
     /// Rate Limiter for transmitted packages.
@@ -34,9 +37,10 @@ impl From<&Net> for NetworkInterfaceConfig {
         let rx_rl: RateLimiterConfig = net.rx_rate_limiter().into();
         let tx_rl: RateLimiterConfig = net.tx_rate_limiter().into();
         NetworkInterfaceConfig {
-            iface_id: net.id().clone(),
+            iface_id: net.id().to_string(),
             host_dev_name: net.iface_name(),
             guest_mac: net.guest_mac().copied(),
+            mtu: net.mtu(),
             rx_rate_limiter: rx_rl.into_option(),
             tx_rate_limiter: tx_rl.into_option(),
         }
@@ -108,7 +112,7 @@ impl NetBuilder {
             let mac_conflict = |net: &Arc<Mutex<Net>>| {
                 let net = net.lock().expect("Poisoned lock");
                 // Check if another net dev has same MAC.
-                Some(mac_address) == net.guest_mac() && &netif_config.iface_id != net.id()
+                Some(mac_address) == net.guest_mac() && netif_config.iface_id != net.id()
             };
             // Validate there is no Mac conflict.
             // No need to validate host_dev_name conflict. In such a case,
@@ -124,7 +128,7 @@ impl NetBuilder {
         if let Some(index) = self
             .net_devices
             .iter()
-            .position(|net| net.lock().expect("Poisoned lock").id() == &netif_config.iface_id)
+            .position(|net| net.lock().expect("Poisoned lock").id() == netif_config.iface_id)
         {
             self.net_devices.swap_remove(index);
         }
@@ -156,6 +160,7 @@ impl NetBuilder {
             cfg.guest_mac,
             rx_rate_limiter.unwrap_or_default(),
             tx_rate_limiter.unwrap_or_default(),
+            cfg.mtu,
         )
         .map_err(NetworkInterfaceError::CreateNetworkDevice)
     }
@@ -188,6 +193,7 @@ mod tests {
             iface_id: String::from(id),
             host_dev_name: String::from(name),
             guest_mac: Some(MacAddr::from_str(mac).unwrap()),
+            mtu: None,
             rx_rate_limiter: RateLimiterConfig::default().into_option(),
             tx_rate_limiter: RateLimiterConfig::default().into_option(),
         }
@@ -199,6 +205,7 @@ mod tests {
                 iface_id: self.iface_id.clone(),
                 host_dev_name: self.host_dev_name.clone(),
                 guest_mac: self.guest_mac,
+                mtu: self.mtu,
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
             }
@@ -333,6 +340,7 @@ mod tests {
             Some(MacAddr::from_str(guest_mac).unwrap()),
             RateLimiter::default(),
             RateLimiter::default(),
+            None,
         )
         .unwrap();
 

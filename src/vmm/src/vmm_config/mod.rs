@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::convert::{From, TryInto};
-use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 
-use libc::O_NONBLOCK;
 use serde::{Deserialize, Serialize};
 
+use crate::devices::virtio::device::VirtioDeviceType;
 use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenBucket};
+use crate::vmm_config::drive::BlockDeviceConfig;
+use crate::vmm_config::net::NetworkInterfaceConfig;
+use crate::vmm_config::pmem::PmemConfig;
 
 /// Wrapper for configuring the balloon device.
 pub mod balloon;
@@ -24,26 +24,47 @@ pub mod entropy;
 pub mod instance_info;
 /// Wrapper for configuring the memory and CPU of the microVM.
 pub mod machine_config;
+/// Wrapper for configuring memory hotplug.
+pub mod memory_hotplug;
 /// Wrapper for configuring the metrics.
 pub mod metrics;
 /// Wrapper for configuring the MMDS.
 pub mod mmds;
 /// Wrapper for configuring the network devices attached to the microVM.
 pub mod net;
+/// Wrapper for configuring the pmem devises attached to the microVM.
+pub mod pmem;
 /// Wrapper for configuring microVM snapshots and the microVM state.
 pub mod serial;
 pub mod snapshot;
 /// Wrapper for configuring the vsock devices attached to the microVM.
 pub mod vsock;
 
-// TODO: Migrate the VMM public-facing code (i.e. interface) to use stateless structures,
-// for receiving data/args, such as the below `RateLimiterConfig` and `TokenBucketConfig`.
-// Also todo: find a better suffix than `Config`; it should illustrate the static nature
-// of the enclosed data.
-// Currently, data is passed around using live/stateful objects. Switching to static/stateless
-// objects will simplify both the ownership model and serialization.
-// Public access would then be more tightly regulated via `VmmAction`s, consisting of tuples like
-// (entry-point-into-VMM-logic, stateless-args-structure).
+#[allow(missing_docs)]
+#[derive(Debug)]
+pub enum HotplugDeviceConfig {
+    Block(BlockDeviceConfig),
+    Pmem(PmemConfig),
+    Net(NetworkInterfaceConfig),
+}
+
+impl HotplugDeviceConfig {
+    pub(crate) fn device_id(&self) -> &str {
+        match self {
+            Self::Block(cfg) => &cfg.drive_id,
+            Self::Pmem(cfg) => &cfg.id,
+            Self::Net(cfg) => &cfg.iface_id,
+        }
+    }
+
+    pub(crate) fn device_type(&self) -> VirtioDeviceType {
+        match self {
+            Self::Block(_) => VirtioDeviceType::Block,
+            Self::Pmem(_) => VirtioDeviceType::Pmem,
+            Self::Net(_) => VirtioDeviceType::Net,
+        }
+    }
+}
 
 /// A public-facing, stateless structure, holding all the data we need to create a TokenBucket
 /// (live) object.
@@ -163,18 +184,6 @@ impl RateLimiterConfig {
             None
         }
     }
-}
-
-/// Create and opens a File for writing to it.
-/// In case we open a FIFO, in order to not block the instance if nobody is consuming the message
-/// that is flushed to the two pipes, we are opening it with `O_NONBLOCK` flag.
-/// In this case, writing to a pipe will start failing when reaching 64K of unconsumed content.
-fn open_file_nonblock(path: &Path) -> Result<File, std::io::Error> {
-    OpenOptions::new()
-        .custom_flags(O_NONBLOCK)
-        .read(true)
-        .write(true)
-        .open(path)
 }
 
 #[cfg(test)]

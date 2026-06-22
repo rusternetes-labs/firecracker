@@ -17,12 +17,11 @@ pub mod pci;
 pub mod pseudo;
 pub mod virtio;
 
-use log::error;
-
 use crate::devices::virtio::net::metrics::NetDeviceMetrics;
 use crate::devices::virtio::queue::{InvalidAvailIdx, QueueError};
 use crate::devices::virtio::vsock::VsockError;
-use crate::logger::IncMetric;
+use crate::logger::{IncMetric, error};
+use crate::vstate::interrupts::InterruptError;
 
 // Function used for reporting error in terms of logging
 // but also in terms of metrics of net event fails.
@@ -41,7 +40,7 @@ pub enum DeviceError {
     /// Failed to read from the TAP device.
     FailedReadTap,
     /// Failed to signal irq: {0}
-    FailedSignalingIrq(io::Error),
+    FailedSignalingIrq(#[from] InterruptError),
     /// IO error: {0}
     IoError(io::Error),
     /// Device received malformed payload.

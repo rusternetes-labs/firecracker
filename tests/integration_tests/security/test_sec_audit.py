@@ -1,6 +1,7 @@
 # Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Tests ensuring security vulnerabilities are not present in dependencies."""
+
 import json
 
 import pytest
@@ -35,6 +36,6 @@ def test_cargo_audit():
         )
 
     git_ab_test_host_command_if_pr(
-        "cargo audit --deny warnings -q --json",
+        "cargo install --locked cargo-audit && cargo audit --deny warnings -q --json",
         comparator=set_did_not_grow_comparator(set_of_vulnerabilities),
     )

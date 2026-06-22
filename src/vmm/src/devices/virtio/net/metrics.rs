@@ -12,7 +12,6 @@
 //!  "net_eth0": {
 //!     "activate_fails": "SharedIncMetric",
 //!     "cfg_fails": "SharedIncMetric",
-//!     "mac_address_updates": "SharedIncMetric",
 //!     "no_rx_avail_buffer": "SharedIncMetric",
 //!     "no_tx_avail_buffer": "SharedIncMetric",
 //!     ...
@@ -20,7 +19,6 @@
 //!  "net_eth1": {
 //!     "activate_fails": "SharedIncMetric",
 //!     "cfg_fails": "SharedIncMetric",
-//!     "mac_address_updates": "SharedIncMetric",
 //!     "no_rx_avail_buffer": "SharedIncMetric",
 //!     "no_tx_avail_buffer": "SharedIncMetric",
 //!     ...
@@ -29,7 +27,6 @@
 //!  "net_iface_id": {
 //!     "activate_fails": "SharedIncMetric",
 //!     "cfg_fails": "SharedIncMetric",
-//!     "mac_address_updates": "SharedIncMetric",
 //!     "no_rx_avail_buffer": "SharedIncMetric",
 //!     "no_tx_avail_buffer": "SharedIncMetric",
 //!     ...
@@ -37,7 +34,6 @@
 //!  "net": {
 //!     "activate_fails": "SharedIncMetric",
 //!     "cfg_fails": "SharedIncMetric",
-//!     "mac_address_updates": "SharedIncMetric",
 //!     "no_rx_avail_buffer": "SharedIncMetric",
 //!     "no_tx_avail_buffer": "SharedIncMetric",
 //!     ...
@@ -126,7 +122,7 @@ static METRICS: RwLock<NetMetricsPerDevice> = RwLock::new(NetMetricsPerDevice {
 pub fn flush_metrics<S: Serializer>(serializer: S) -> Result<S::Ok, S::Error> {
     let net_metrics = METRICS.read().unwrap();
     let metrics_len = net_metrics.metrics.len();
-    // +1 to accomodate aggregate net metrics
+    // +1 to accommodate aggregate net metrics
     let mut seq = serializer.serialize_map(Some(1 + metrics_len))?;
 
     let mut net_aggregated: NetDeviceMetrics = NetDeviceMetrics::default();
@@ -149,8 +145,6 @@ pub struct NetDeviceMetrics {
     pub activate_fails: SharedIncMetric,
     /// Number of times when interacting with the space config of a network device failed.
     pub cfg_fails: SharedIncMetric,
-    /// Number of times the mac address was updated through the config space.
-    pub mac_address_updates: SharedIncMetric,
     /// No available buffer for the net device rx queue.
     pub no_rx_avail_buffer: SharedIncMetric,
     /// No available buffer for the net device tx queue.
@@ -161,8 +155,6 @@ pub struct NetDeviceMetrics {
     pub rx_queue_event_count: SharedIncMetric,
     /// Number of events associated with the rate limiter installed on the receiving path.
     pub rx_event_rate_limiter_count: SharedIncMetric,
-    /// Number of RX partial writes to guest.
-    pub rx_partial_writes: SharedIncMetric,
     /// Number of RX rate limiter throttling events.
     pub rx_rate_limiter_throttled: SharedIncMetric,
     /// Number of events received on the associated tap.
@@ -191,8 +183,6 @@ pub struct NetDeviceMetrics {
     pub tx_count: SharedIncMetric,
     /// Number of transmitted packets.
     pub tx_packets_count: SharedIncMetric,
-    /// Number of TX partial reads from guest.
-    pub tx_partial_reads: SharedIncMetric,
     /// Number of events associated with the transmitting queue.
     pub tx_queue_event_count: SharedIncMetric,
     /// Number of events associated with the rate limiter installed on the transmitting path.
@@ -222,8 +212,6 @@ impl NetDeviceMetrics {
     pub fn aggregate(&mut self, other: &Self) {
         self.activate_fails.add(other.activate_fails.fetch_diff());
         self.cfg_fails.add(other.cfg_fails.fetch_diff());
-        self.mac_address_updates
-            .add(other.mac_address_updates.fetch_diff());
         self.no_rx_avail_buffer
             .add(other.no_rx_avail_buffer.fetch_diff());
         self.no_tx_avail_buffer
@@ -233,8 +221,6 @@ impl NetDeviceMetrics {
             .add(other.rx_queue_event_count.fetch_diff());
         self.rx_event_rate_limiter_count
             .add(other.rx_event_rate_limiter_count.fetch_diff());
-        self.rx_partial_writes
-            .add(other.rx_partial_writes.fetch_diff());
         self.rx_rate_limiter_throttled
             .add(other.rx_rate_limiter_throttled.fetch_diff());
         self.rx_tap_event_count
@@ -256,8 +242,6 @@ impl NetDeviceMetrics {
         self.tx_count.add(other.tx_count.fetch_diff());
         self.tx_packets_count
             .add(other.tx_packets_count.fetch_diff());
-        self.tx_partial_reads
-            .add(other.tx_partial_reads.fetch_diff());
         self.tx_queue_event_count
             .add(other.tx_queue_event_count.fetch_diff());
         self.tx_rate_limiter_event_count

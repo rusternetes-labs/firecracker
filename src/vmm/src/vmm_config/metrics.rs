@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::open_file_nonblock;
 use crate::logger::{FcLineWriter, METRICS};
+use crate::utils::open_file_nonblock;
 
 /// Strongly typed structure used to describe the metrics system.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -42,12 +42,6 @@ mod tests {
 
     #[test]
     fn test_init_metrics() {
-        // Error case: initializing metrics with invalid pipe returns error.
-        let desc = MetricsConfig {
-            metrics_path: PathBuf::from("not_found_file_metrics"),
-        };
-        init_metrics(desc).unwrap_err();
-
         // Initializing metrics with valid pipe is ok.
         let metrics_file = TempFile::new().unwrap();
         let desc = MetricsConfig {

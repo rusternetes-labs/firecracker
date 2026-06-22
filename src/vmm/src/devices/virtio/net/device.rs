@@ -13,18 +13,16 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use libc::{EAGAIN, iovec};
-use log::{error, info};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::NET_QUEUE_MAX_SIZE;
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice};
+use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
-use crate::devices::virtio::generated::virtio_ids::VIRTIO_ID_NET;
 use crate::devices::virtio::generated::virtio_net::{
     VIRTIO_NET_F_CSUM, VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6,
     VIRTIO_NET_F_GUEST_UFO, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_HOST_TSO6, VIRTIO_NET_F_HOST_UFO,
-    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, virtio_net_hdr_v1,
+    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU, virtio_net_hdr_v1,
 };
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::iovec::{
@@ -41,7 +39,7 @@ use crate::devices::{DeviceError, report_net_event_fail};
 use crate::dumbo::pdu::arp::ETH_IPV4_FRAME_LEN;
 use crate::dumbo::pdu::ethernet::{EthernetFrame, PAYLOAD_OFFSET};
 use crate::impl_device_type;
-use crate::logger::{IncMetric, METRICS};
+use crate::logger::{IncMetric, METRICS, error, warn};
 use crate::mmds::data_store::Mmds;
 use crate::mmds::ns::MmdsNetworkStack;
 use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenType};
@@ -90,6 +88,13 @@ fn init_vnet_hdr(buf: &mut [u8]) {
 #[repr(C)]
 pub struct ConfigSpace {
     pub guest_mac: MacAddr,
+    // Padding fields to match the virtio_net_config layout:
+    // offset 6: status (u16, not advertised)
+    _status: u16,
+    // offset 8: max_virtqueue_pairs (u16, not advertised)
+    _max_virtqueue_pairs: u16,
+    // offset 10: mtu (u16, advertised via VIRTIO_NET_F_MTU)
+    pub mtu: u16,
 }
 
 // SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
@@ -277,6 +282,7 @@ impl Net {
         guest_mac: Option<MacAddr>,
         rx_rate_limiter: RateLimiter,
         tx_rate_limiter: RateLimiter,
+        mtu: Option<u16>,
     ) -> Result<Self, NetError> {
         let mut avail_features = (1 << VIRTIO_NET_F_GUEST_CSUM)
             | (1 << VIRTIO_NET_F_CSUM)
@@ -291,6 +297,13 @@ impl Net {
             | (1 << VIRTIO_RING_F_EVENT_IDX);
 
         let mut config_space = ConfigSpace::default();
+        if let Some(mtu) = mtu {
+            if !(68..=65535).contains(&mtu) {
+                return Err(NetError::InvalidMtu(mtu));
+            }
+            avail_features |= 1 << VIRTIO_NET_F_MTU;
+            config_space.mtu = mtu;
+        }
         if let Some(mac) = guest_mac {
             config_space.guest_mac = mac;
             // Enabling feature for MAC address configuration
@@ -334,6 +347,7 @@ impl Net {
         guest_mac: Option<MacAddr>,
         rx_rate_limiter: RateLimiter,
         tx_rate_limiter: RateLimiter,
+        mtu: Option<u16>,
     ) -> Result<Self, NetError> {
         let tap = Tap::open_named(tap_if_name).map_err(NetError::TapOpen)?;
 
@@ -341,12 +355,7 @@ impl Net {
         tap.set_vnet_hdr_size(vnet_hdr_size)
             .map_err(NetError::TapSetVnetHdrSize)?;
 
-        Self::new_with_tap(id, tap, guest_mac, rx_rate_limiter, tx_rate_limiter)
-    }
-
-    /// Provides the ID of this net device.
-    pub fn id(&self) -> &String {
-        &self.id
+        Self::new_with_tap(id, tap, guest_mac, rx_rate_limiter, tx_rate_limiter, mtu)
     }
 
     /// Provides the MAC of this net device.
@@ -357,6 +366,15 @@ impl Net {
     /// Provides the host IFACE name of this net device.
     pub fn iface_name(&self) -> String {
         self.tap.if_name_as_str().to_string()
+    }
+
+    /// Returns the configured MTU if `VIRTIO_NET_F_MTU` is advertised, otherwise `None`.
+    pub fn mtu(&self) -> Option<u16> {
+        if self.avail_features & (1 << VIRTIO_NET_F_MTU) != 0 {
+            Some(self.config_space.mtu)
+        } else {
+            None
+        }
     }
 
     /// Provides the MmdsNetworkStack of this net device.
@@ -510,6 +528,30 @@ impl Net {
         guest_mac: Option<MacAddr>,
         net_metrics: &NetDeviceMetrics,
     ) -> Result<bool, NetError> {
+        // There is a potential for a TOCTOU race condition here where,
+        // when MMDS is enabled, the guest can rewrite packet headers between
+        // the time that we check that a packet should be detoured to MMDS,
+        // and the time that we forward it to the TAP.
+        //
+        // The implication of this is that a malicious guest can construct a
+        // packet destined for the TAP (i.e., dest_ip != 169.254.169.254), then race
+        // to overwrite the destination IP to 169.254.169.254. the packet will
+        // then be sent over the TAP towards the host's IMDS store.
+        //
+        // We do not plan to fix this for a few reasons:
+        //
+        // 1. Without MMDS enabled, packets with destination IP 169.254.169.254
+        //    will be forwarded to the TAP without filtering. Operators should
+        //    not rely on MMDS for IMDS access control.
+        // 2. Guest originated traffic is treated as untrusted and Firecracker
+        //    does not filter IPv4 packets. Operators deploying Firecracker
+        //    based services should implement host-level firewall rules to
+        //    restrict guest egress traffic.
+        // 3. Preventing this TOCTOU by copying packets to to a host buffer
+        //    before routing decisions would significantly reduce guest-to-host
+        //    TCP throughput, which is not justifiable given the mitigations
+        //    available at host-level.
+
         // Read the frame headers from the IoVecBuffer
         let max_header_len = headers.len();
         let header_len = frame_iovec
@@ -938,30 +980,14 @@ impl Net {
 
         Ok(())
     }
-
-    /// Prepare saving state
-    pub fn prepare_save(&mut self) {
-        // We shouldn't be messing with the queue if the device is not activated.
-        // Anyways, if it isn't there's nothing to prepare; we haven't parsed any
-        // descriptors yet from it and we can't have a deferred frame.
-        if !self.is_activated() {
-            return;
-        }
-
-        // Give potential deferred RX frame to guest
-        self.rx_buffer.finish_frame(&mut self.queues[RX_INDEX]);
-        // Reset the parsed available descriptors, so we will re-parse them
-        self.queues[RX_INDEX].next_avail -=
-            Wrapping(u16::try_from(self.rx_buffer.parsed_descriptors.len()).unwrap());
-        self.rx_buffer.parsed_descriptors.clear();
-        self.rx_buffer.iovec.clear();
-        self.rx_buffer.used_bytes = 0;
-        self.rx_buffer.used_descriptors = 0;
-    }
 }
 
 impl VirtioDevice for Net {
-    impl_device_type!(VIRTIO_ID_NET);
+    impl_device_type!(VirtioDeviceType::Net);
+
+    fn id(&self) -> &str {
+        &self.id
+    }
 
     fn avail_features(&self) -> u64 {
         self.avail_features
@@ -1006,21 +1032,12 @@ impl VirtioDevice for Net {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        let config_space_bytes = self.config_space.as_mut_slice();
-        let start = usize::try_from(offset).ok();
-        let end = start.and_then(|s| s.checked_add(data.len()));
-        let Some(dst) = start
-            .zip(end)
-            .and_then(|(start, end)| config_space_bytes.get_mut(start..end))
-        else {
-            error!("Failed to write config space");
-            self.metrics.cfg_fails.inc();
-            return;
-        };
-
-        dst.copy_from_slice(data);
-        self.guest_mac = Some(self.config_space.guest_mac);
-        self.metrics.mac_address_updates.inc();
+        self.metrics.cfg_fails.inc();
+        warn!(
+            "virtio-net: guest driver attempted to write device config (offset={:#x}, len={:#x})",
+            offset,
+            data.len()
+        );
     }
 
     fn activate(
@@ -1059,15 +1076,24 @@ impl VirtioDevice for Net {
         self.device_state.is_activated()
     }
 
-    fn kick(&mut self) {
-        // If device is activated, kick the net queue(s) to make up for any
-        // pending or in-flight epoll events we may have not captured in snapshot.
-        // No need to kick Ratelimiters because they are restored 'unblocked' so
-        // any inflight `timer_fd` events can be safely discarded.
-        if self.is_activated() {
-            info!("kick net {}.", self.id());
-            self.process_virtio_queues();
+    /// Prepare saving state
+    fn prepare_save(&mut self) {
+        // We shouldn't be messing with the queue if the device is not activated.
+        // Anyways, if it isn't there's nothing to prepare; we haven't parsed any
+        // descriptors yet from it and we can't have a deferred frame.
+        if !self.is_activated() {
+            return;
         }
+
+        // Give potential deferred RX frame to guest
+        self.rx_buffer.finish_frame(&mut self.queues[RX_INDEX]);
+        // Reset the parsed available descriptors, so we will re-parse them
+        self.queues[RX_INDEX].next_avail -=
+            Wrapping(u16::try_from(self.rx_buffer.parsed_descriptors.len()).unwrap());
+        self.rx_buffer.parsed_descriptors.clear();
+        self.rx_buffer.iovec.clear();
+        self.rx_buffer.used_bytes = 0;
+        self.rx_buffer.used_descriptors = 0;
     }
 }
 
@@ -1093,8 +1119,8 @@ pub mod tests {
     };
     use crate::devices::virtio::net::test_utils::test::TestHelper;
     use crate::devices::virtio::net::test_utils::{
-        NetEvent, NetQueue, TapTrafficSimulator, default_net, if_index, inject_tap_tx_frame,
-        set_mac,
+        NetEvent, NetQueue, TapTrafficSimulator, default_net, enable, if_index,
+        inject_tap_tx_frame, set_mac,
     };
     use crate::devices::virtio::queue::VIRTQ_DESC_F_WRITE;
     use crate::devices::virtio::test_utils::VirtQueue;
@@ -1153,42 +1179,7 @@ pub mod tests {
     fn test_virtio_device_type() {
         let mut net = default_net();
         set_mac(&mut net, MacAddr::from_str("11:22:33:44:55:66").unwrap());
-        assert_eq!(net.device_type(), VIRTIO_ID_NET);
-    }
-
-    #[test]
-    fn test_virtio_device_features() {
-        let mut net = default_net();
-        set_mac(&mut net, MacAddr::from_str("11:22:33:44:55:66").unwrap());
-
-        // Test `features()` and `ack_features()`.
-        let features = (1 << VIRTIO_NET_F_GUEST_CSUM)
-            | (1 << VIRTIO_NET_F_CSUM)
-            | (1 << VIRTIO_NET_F_GUEST_TSO4)
-            | (1 << VIRTIO_NET_F_GUEST_TSO6)
-            | (1 << VIRTIO_NET_F_MAC)
-            | (1 << VIRTIO_NET_F_GUEST_UFO)
-            | (1 << VIRTIO_NET_F_HOST_TSO4)
-            | (1 << VIRTIO_NET_F_HOST_TSO6)
-            | (1 << VIRTIO_NET_F_HOST_UFO)
-            | (1 << VIRTIO_F_VERSION_1)
-            | (1 << VIRTIO_NET_F_MRG_RXBUF)
-            | (1 << VIRTIO_RING_F_EVENT_IDX);
-
-        assert_eq!(
-            net.avail_features_by_page(0),
-            (features & 0xFFFFFFFF) as u32,
-        );
-        assert_eq!(net.avail_features_by_page(1), (features >> 32) as u32);
-        for i in 2..10 {
-            assert_eq!(net.avail_features_by_page(i), 0u32);
-        }
-
-        for i in 0..10 {
-            net.ack_features_by_page(i, u32::MAX);
-        }
-
-        assert_eq!(net.acked_features, features);
+        assert_eq!(net.device_type(), VirtioDeviceType::Net);
     }
 
     #[test]
@@ -1223,6 +1214,58 @@ pub mod tests {
     }
 
     #[test]
+    fn test_mtu_advertised() {
+        // "net-device%d" asks the kernel to assign a unique tap index.
+        let mut net = Net::new(
+            "mtu-test".to_string(),
+            "net-device%d",
+            None,
+            RateLimiter::default(),
+            RateLimiter::default(),
+            Some(9000),
+        )
+        .unwrap();
+        enable(&net.tap);
+
+        // VIRTIO_NET_F_MTU must be advertised.
+        assert!(net.avail_features & (1 << VIRTIO_NET_F_MTU) != 0);
+        // mtu() must return the configured value.
+        assert_eq!(net.mtu(), Some(9000));
+        // config space must carry the value at the correct offset.
+        let mut buf = [0u8; 2];
+        net.read_config(10, &mut buf);
+        assert_eq!(u16::from_le_bytes(buf), 9000);
+    }
+
+    #[test]
+    fn test_mtu_not_advertised() {
+        let net = default_net();
+        assert!(net.avail_features & (1 << VIRTIO_NET_F_MTU) == 0);
+        assert_eq!(net.mtu(), None);
+    }
+
+    #[test]
+    fn test_mtu_out_of_range() {
+        let make = |mtu| {
+            Net::new(
+                "mtu-range-test".to_string(),
+                "net-device%d",
+                None,
+                RateLimiter::default(),
+                RateLimiter::default(),
+                Some(mtu),
+            )
+        };
+        assert!(matches!(make(0), Err(NetError::InvalidMtu(0))));
+        assert!(matches!(make(67), Err(NetError::InvalidMtu(67))));
+        // Boundary values must succeed (no tap needed to check the error path).
+        // 68 and 65535 are valid; we cannot call .unwrap() here because the
+        // tap creation requires CAP_NET_ADMIN, but the error must NOT be InvalidMtu.
+        assert!(!matches!(make(68), Err(NetError::InvalidMtu(_))));
+        assert!(!matches!(make(65535), Err(NetError::InvalidMtu(_))));
+    }
+
+    #[test]
     fn test_virtio_device_read_config() {
         let mut net = default_net();
         set_mac(&mut net, MacAddr::from_str("11:22:33:44:55:66").unwrap());
@@ -1240,42 +1283,52 @@ pub mod tests {
     }
 
     #[test]
-    fn test_virtio_device_rewrite_config() {
+    fn test_virtio_device_config_space_is_read_only() {
         let mut net = default_net();
-        set_mac(&mut net, MacAddr::from_str("11:22:33:44:55:66").unwrap());
+        let initial_mac = MacAddr::from_str("11:22:33:44:55:66").unwrap();
+        set_mac(&mut net, initial_mac);
 
-        let new_config: [u8; MAC_ADDR_LEN as usize] = [0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
-        net.write_config(0, &new_config);
-        let mut new_config_read = [0u8; MAC_ADDR_LEN as usize];
-        net.read_config(0, &mut new_config_read);
-        assert_eq!(new_config, new_config_read);
+        let initial_bytes: [u8; MAC_ADDR_LEN as usize] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
-        // Check that the guest MAC was updated.
-        let expected_guest_mac = MacAddr::from_bytes_unchecked(&new_config);
-        assert_eq!(expected_guest_mac, net.guest_mac.unwrap());
-        assert_eq!(net.metrics.mac_address_updates.count(), 1);
+        // Sanity check: the configured MAC is what the guest reads back.
+        let mut config_read = [0u8; MAC_ADDR_LEN as usize];
+        net.read_config(0, &mut config_read);
+        assert_eq!(config_read, initial_bytes);
+        assert_eq!(net.guest_mac.unwrap(), initial_mac);
 
-        // Partial write (this is how the kernel sets a new mac address) - byte by byte.
-        let new_config = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-        for i in 0..new_config.len() {
-            net.write_config(i as u64, &new_config[i..=i]);
+        // A 6-byte write to offset 0 must be rejected and leave both the
+        // config space bytes and the device's stored guest_mac unchanged.
+        let attempted_bytes: [u8; MAC_ADDR_LEN as usize] = [0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+        let cfg_fails_before = net.metrics.cfg_fails.count();
+        net.write_config(0, &attempted_bytes);
+        net.read_config(0, &mut config_read);
+        assert_eq!(config_read, initial_bytes);
+        assert_eq!(net.guest_mac.unwrap(), initial_mac);
+        assert_eq!(net.metrics.cfg_fails.count(), cfg_fails_before + 1);
+
+        // Single-byte writes covering the MAC region must also be rejected
+        // without changing state.
+        let cfg_fails_before = net.metrics.cfg_fails.count();
+        for i in 0..attempted_bytes.len() {
+            net.write_config(i as u64, &attempted_bytes[i..=i]);
         }
-        net.read_config(0, &mut new_config_read);
-        assert_eq!(new_config, new_config_read);
+        net.read_config(0, &mut config_read);
+        assert_eq!(config_read, initial_bytes);
+        assert_eq!(net.guest_mac.unwrap(), initial_mac);
+        assert_eq!(
+            net.metrics.cfg_fails.count(),
+            cfg_fails_before + attempted_bytes.len() as u64
+        );
 
-        // Invalid write.
-        net.write_config(5, &new_config);
-        // Verify old config was untouched.
-        new_config_read = [0u8; MAC_ADDR_LEN as usize];
-        net.read_config(0, &mut new_config_read);
-        assert_eq!(new_config, new_config_read);
-
-        // Large offset that may cause an overflow.
-        net.write_config(u64::MAX, &new_config);
-        // Verify old config was untouched.
-        new_config_read = [0u8; MAC_ADDR_LEN as usize];
-        net.read_config(0, &mut new_config_read);
-        assert_eq!(new_config, new_config_read);
+        // Out-of-range and overflowing offsets must be rejected without
+        // changing state.
+        let cfg_fails_before = net.metrics.cfg_fails.count();
+        net.write_config(5, &attempted_bytes);
+        net.write_config(u64::MAX, &attempted_bytes);
+        net.read_config(0, &mut config_read);
+        assert_eq!(config_read, initial_bytes);
+        assert_eq!(net.guest_mac.unwrap(), initial_mac);
+        assert_eq!(net.metrics.cfg_fails.count(), cfg_fails_before + 2);
     }
 
     #[test]

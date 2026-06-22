@@ -5,8 +5,8 @@ use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
 use event_manager::{EventOps, Events, MutEventSubscriber};
-use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
-use vmm::logger::{IncMetric, METRICS, error, warn};
+use utils::time::TimerFd;
+use vmm::logger::{IncMetric, METRICS, error_unrestricted, warn_unrestricted};
 use vmm_sys_util::epoll::EventSet;
 
 /// Metrics reporting period.
@@ -23,8 +23,7 @@ pub(crate) struct PeriodicMetrics {
 impl PeriodicMetrics {
     /// PeriodicMetrics constructor. Can panic on `TimerFd` creation failure.
     pub fn new() -> Self {
-        let write_metrics_event_fd = TimerFd::new_custom(ClockId::Monotonic, true, true)
-            .expect("Cannot create the metrics timer fd.");
+        let write_metrics_event_fd = TimerFd::new();
         PeriodicMetrics {
             write_metrics_event_fd,
             #[cfg(test)]
@@ -35,12 +34,8 @@ impl PeriodicMetrics {
     /// Start the periodic metrics engine which will flush metrics every `interval_ms` millisecs.
     pub(crate) fn start(&mut self, interval_ms: u64) {
         // Arm the log write timer.
-        let timer_state = TimerState::Periodic {
-            current: Duration::from_millis(interval_ms),
-            interval: Duration::from_millis(interval_ms),
-        };
-        self.write_metrics_event_fd
-            .set_state(timer_state, SetTimeFlags::Default);
+        let duration = Duration::from_millis(interval_ms);
+        self.write_metrics_event_fd.arm(duration, Some(duration));
 
         // Write the metrics straight away to check the process startup time.
         self.write_metrics();
@@ -49,7 +44,7 @@ impl PeriodicMetrics {
     fn write_metrics(&mut self) {
         if let Err(err) = METRICS.write() {
             METRICS.logger.missed_metrics_count.inc();
-            error!("Failed to write metrics: {}", err);
+            error_unrestricted!("Failed to write metrics: {}", err);
         }
 
         #[cfg(test)]
@@ -65,13 +60,12 @@ impl MutEventSubscriber for PeriodicMetrics {
         let source = event.fd();
         let event_set = event.event_set();
 
-        // TODO: also check for errors. Pending high level discussions on how we want
-        // to handle errors in devices.
         let supported_events = EventSet::IN;
         if !supported_events.contains(event_set) {
-            warn!(
+            warn_unrestricted!(
                 "Received unknown event: {:?} from source: {:?}",
-                event_set, source
+                event_set,
+                source
             );
             return;
         }
@@ -80,13 +74,13 @@ impl MutEventSubscriber for PeriodicMetrics {
             self.write_metrics_event_fd.read();
             self.write_metrics();
         } else {
-            error!("Spurious METRICS event!");
+            error_unrestricted!("Spurious METRICS event!");
         }
     }
 
     fn init(&mut self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::new(&self.write_metrics_event_fd, EventSet::IN)) {
-            error!("Failed to register metrics event: {}", err);
+            error_unrestricted!("Failed to register metrics event: {}", err);
         }
     }
 }

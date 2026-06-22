@@ -50,6 +50,8 @@ pub struct ResourceAllocator {
     pub mmio32_memory: AddressAllocator,
     /// Allocator for memory in the 64-bit MMIO address space
     pub mmio64_memory: AddressAllocator,
+    /// Allocator for memory after the 64-bit MMIO address space
+    pub past_mmio64_memory: AddressAllocator,
     /// Memory allocator for system data
     pub system_memory: AddressAllocator,
 }
@@ -79,6 +81,11 @@ impl ResourceAllocator {
                 arch::MEM_64BIT_DEVICES_SIZE,
             )
             .unwrap(),
+            past_mmio64_memory: AddressAllocator::new(
+                arch::FIRST_ADDR_PAST_64BITS_MMIO,
+                arch::PAST_64BITS_MMIO_SIZE,
+            )
+            .unwrap(),
             system_memory: AddressAllocator::new(arch::SYSTEM_MEM_START, arch::SYSTEM_MEM_SIZE)
                 .unwrap(),
         }
@@ -101,69 +108,6 @@ impl ResourceAllocator {
     pub fn allocate_gsi_msi(&mut self, gsi_count: u32) -> Result<Vec<u32>, vm_allocator::Error> {
         allocate_many_ids(&mut self.gsi_msi_allocator, gsi_count)
     }
-
-    /// Allocate a memory range in 32-bit MMIO address space
-    ///
-    /// If it succeeds, it returns the first address of the allocated range
-    ///
-    /// # Arguments
-    ///
-    /// * `size` - The size in bytes of the memory to allocate
-    /// * `alignment` - The alignment of the address of the first byte
-    /// * `policy` - A [`vm_allocator::AllocPolicy`] variant for determining the allocation policy
-    pub fn allocate_32bit_mmio_memory(
-        &mut self,
-        size: u64,
-        alignment: u64,
-        policy: AllocPolicy,
-    ) -> Result<u64, vm_allocator::Error> {
-        Ok(self
-            .mmio32_memory
-            .allocate(size, alignment, policy)?
-            .start())
-    }
-
-    /// Allocate a memory range in 64-bit MMIO address space
-    ///
-    /// If it succeeds, it returns the first address of the allocated range
-    ///
-    /// # Arguments
-    ///
-    /// * `size` - The size in bytes of the memory to allocate
-    /// * `alignment` - The alignment of the address of the first byte
-    /// * `policy` - A [`vm_allocator::AllocPolicy`] variant for determining the allocation policy
-    pub fn allocate_64bit_mmio_memory(
-        &mut self,
-        size: u64,
-        alignment: u64,
-        policy: AllocPolicy,
-    ) -> Result<u64, vm_allocator::Error> {
-        Ok(self
-            .mmio64_memory
-            .allocate(size, alignment, policy)?
-            .start())
-    }
-
-    /// Allocate a memory range for system data
-    ///
-    /// If it succeeds, it returns the first address of the allocated range
-    ///
-    /// # Arguments
-    ///
-    /// * `size` - The size in bytes of the memory to allocate
-    /// * `alignment` - The alignment of the address of the first byte
-    /// * `policy` - A [`vm_allocator::AllocPolicy`] variant for determining the allocation policy
-    pub fn allocate_system_memory(
-        &mut self,
-        size: u64,
-        alignment: u64,
-        policy: AllocPolicy,
-    ) -> Result<u64, vm_allocator::Error> {
-        Ok(self
-            .system_memory
-            .allocate(size, alignment, policy)?
-            .start())
-    }
 }
 
 impl<'a> Persist<'a> for ResourceAllocator {
@@ -178,18 +122,15 @@ impl<'a> Persist<'a> for ResourceAllocator {
     fn restore(
         _constructor_args: Self::ConstructorArgs,
         state: &Self::State,
-    ) -> std::result::Result<Self, Self::Error> {
+    ) -> Result<Self, Self::Error> {
         Ok(state.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use vm_allocator::AllocPolicy;
-
     use super::ResourceAllocator;
-    use crate::arch::{self, GSI_LEGACY_NUM, GSI_LEGACY_START, GSI_MSI_NUM, GSI_MSI_START};
-    use crate::snapshot::{Persist, Snapshot};
+    use crate::arch::{self, GSI_LEGACY_NUM, GSI_MSI_NUM};
 
     #[test]
     fn test_allocate_irq() {
@@ -276,71 +217,5 @@ mod tests {
         for i in arch::GSI_MSI_START + 2..=arch::GSI_MSI_END {
             assert_eq!(allocator.allocate_gsi_msi(1), Ok(vec![i]));
         }
-    }
-
-    fn clone_allocator(allocator: &ResourceAllocator) -> ResourceAllocator {
-        let mut buf = vec![0u8; 1024];
-        Snapshot::new(allocator.save())
-            .save(&mut buf.as_mut_slice())
-            .unwrap();
-        let restored_state: ResourceAllocator = Snapshot::load_without_crc_check(buf.as_slice())
-            .unwrap()
-            .data;
-        ResourceAllocator::restore((), &restored_state).unwrap()
-    }
-
-    #[test]
-    fn test_save_restore() {
-        let mut allocator0 = ResourceAllocator::new();
-        let irq_0 = allocator0.allocate_gsi_legacy(1).unwrap()[0];
-        assert_eq!(irq_0, GSI_LEGACY_START);
-        let gsi_0 = allocator0.allocate_gsi_msi(1).unwrap()[0];
-        assert_eq!(gsi_0, GSI_MSI_START);
-
-        let mut allocator1 = clone_allocator(&allocator0);
-        let irq_1 = allocator1.allocate_gsi_legacy(1).unwrap()[0];
-        assert_eq!(irq_1, GSI_LEGACY_START + 1);
-        let gsi_1 = allocator1.allocate_gsi_msi(1).unwrap()[0];
-        assert_eq!(gsi_1, GSI_MSI_START + 1);
-        let mmio32_mem = allocator1
-            .allocate_32bit_mmio_memory(0x42, 1, AllocPolicy::FirstMatch)
-            .unwrap();
-        assert_eq!(mmio32_mem, arch::MEM_32BIT_DEVICES_START);
-        let mmio64_mem = allocator1
-            .allocate_64bit_mmio_memory(0x42, 1, AllocPolicy::FirstMatch)
-            .unwrap();
-        assert_eq!(mmio64_mem, arch::MEM_64BIT_DEVICES_START);
-        let system_mem = allocator1
-            .allocate_system_memory(0x42, 1, AllocPolicy::FirstMatch)
-            .unwrap();
-        assert_eq!(system_mem, arch::SYSTEM_MEM_START);
-
-        let mut allocator2 = clone_allocator(&allocator1);
-        allocator2
-            .allocate_32bit_mmio_memory(0x42, 1, AllocPolicy::ExactMatch(mmio32_mem))
-            .unwrap_err();
-        allocator2
-            .allocate_64bit_mmio_memory(0x42, 1, AllocPolicy::ExactMatch(mmio64_mem))
-            .unwrap_err();
-        allocator2
-            .allocate_system_memory(0x42, 1, AllocPolicy::ExactMatch(system_mem))
-            .unwrap_err();
-
-        let irq_2 = allocator2.allocate_gsi_legacy(1).unwrap()[0];
-        assert_eq!(irq_2, GSI_LEGACY_START + 2);
-        let gsi_2 = allocator2.allocate_gsi_msi(1).unwrap()[0];
-        assert_eq!(gsi_2, GSI_MSI_START + 2);
-        let mmio32_mem = allocator1
-            .allocate_32bit_mmio_memory(0x42, 1, AllocPolicy::FirstMatch)
-            .unwrap();
-        assert_eq!(mmio32_mem, arch::MEM_32BIT_DEVICES_START + 0x42);
-        let mmio64_mem = allocator1
-            .allocate_64bit_mmio_memory(0x42, 1, AllocPolicy::FirstMatch)
-            .unwrap();
-        assert_eq!(mmio64_mem, arch::MEM_64BIT_DEVICES_START + 0x42);
-        let system_mem = allocator1
-            .allocate_system_memory(0x42, 1, AllocPolicy::FirstMatch)
-            .unwrap();
-        assert_eq!(system_mem, arch::SYSTEM_MEM_START + 0x42);
     }
 }

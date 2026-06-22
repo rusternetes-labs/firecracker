@@ -11,7 +11,7 @@ use std::sync::Arc;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::{Frontend, VhostUserFrontend};
 use vhost::{Error as VhostError, VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
-use vm_memory::{Address, Error as MmapError, GuestMemory, GuestMemoryError, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemory, GuestMemoryError, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::virtio::queue::Queue;
@@ -51,8 +51,8 @@ pub enum VhostUserError {
     VhostUserSetVringKick(VhostError),
     /// Set vring enable failed: {0}
     VhostUserSetVringEnable(VhostError),
-    /// Failed to read vhost eventfd: {0}
-    VhostUserMemoryRegion(MmapError),
+    /// Failed to read vhost eventfd: No memory region found
+    VhostUserNoMemoryRegion,
     /// Invalid used address
     UsedAddress(GuestMemoryError),
 }
@@ -371,16 +371,14 @@ impl<T: VhostUserHandleBackend> VhostUserHandleImpl<T> {
             let (mmap_handle, mmap_offset) = match region.file_offset() {
                 Some(_file_offset) => (_file_offset.file().as_raw_fd(), _file_offset.start()),
                 None => {
-                    return Err(VhostUserError::VhostUserMemoryRegion(
-                        MmapError::NoMemoryRegion,
-                    ));
+                    return Err(VhostUserError::VhostUserNoMemoryRegion);
                 }
             };
 
             let vhost_user_net_reg = VhostUserMemoryRegionInfo {
                 guest_phys_addr: region.start_addr().raw_value(),
                 memory_size: region.len(),
-                userspace_addr: region.as_ptr() as u64,
+                userspace_addr: region.inner.as_ptr() as u64,
                 mmap_offset,
                 mmap_handle,
             };
@@ -480,7 +478,7 @@ pub(crate) mod tests {
     use crate::devices::virtio::test_utils::default_interrupt;
     use crate::test_utils::create_tmp_socket;
     use crate::vstate::memory;
-    use crate::vstate::memory::GuestAddress;
+    use crate::vstate::memory::{GuestAddress, GuestRegionMmapExt};
 
     pub(crate) fn create_mem(file: File, regions: &[(GuestAddress, usize)]) -> GuestMemoryMmap {
         GuestMemoryMmap::from_regions(
@@ -490,7 +488,10 @@ pub(crate) mod tests {
                 Some(file),
                 false,
             )
-            .unwrap(),
+            .unwrap()
+            .into_iter()
+            .map(|region| GuestRegionMmapExt::dram_from_mmap_region(region, 0))
+            .collect(),
         )
         .unwrap()
     }
@@ -800,7 +801,7 @@ pub(crate) mod tests {
             .map(|region| VhostUserMemoryRegionInfo {
                 guest_phys_addr: region.start_addr().raw_value(),
                 memory_size: region.len(),
-                userspace_addr: region.as_ptr() as u64,
+                userspace_addr: region.inner.as_ptr() as u64,
                 mmap_offset: region.file_offset().unwrap().start(),
                 mmap_handle: region.file_offset().unwrap().file().as_raw_fd(),
             })

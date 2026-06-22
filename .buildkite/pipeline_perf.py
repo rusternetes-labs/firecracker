@@ -17,63 +17,95 @@ from common import BKPipeline
 # has to be the node associated with the NUMA node from which we picked CPUs.
 perf_test = {
     "virtio-block-sync": {
-        "label": "💿 Virtio Sync Block Performance",
+        "label": "virtio-block-sync",
         "tests": "integration_tests/performance/test_block.py::test_block_performance -k 'not Async'",
         "devtool_opts": "-c 1-10 -m 0",
     },
     "virtio-block-async": {
-        "label": "💿 Virtio Async Block Performance",
+        "label": "virtio-block-async",
         "tests": "integration_tests/performance/test_block.py::test_block_performance -k Async",
         "devtool_opts": "-c 1-10 -m 0",
     },
     "vhost-user-block": {
-        "label": "💿 vhost-user Block Performance",
+        "label": "vhost-user-block",
         "tests": "integration_tests/performance/test_block.py::test_block_vhost_user_performance",
         "devtool_opts": "-c 1-10 -m 0",
-        "ab_opts": "--noise-threshold 0.1",
+        "ab_opts": "--noise-threshold bw_read=0.1",
+    },
+    "pmem": {
+        "label": "pmem",
+        "tests": "integration_tests/performance/test_pmem.py",
+        "devtool_opts": "-c 1-10 -m 0",
     },
     "network": {
-        "label": "📠 Network Latency and Throughput",
+        "label": "network",
         "tests": "integration_tests/performance/test_network.py",
         "devtool_opts": "-c 1-10 -m 0",
-        # Triggers if delta is > 0.01ms (10µs) or default relative threshold (5%)
-        # only relevant for latency test, throughput test will always be magnitudes above this anyway
-        "ab_opts": "--absolute-strength 0.010",
+    },
+    "vsock-throughput": {
+        "label": "vsock-throughput",
+        "tests": "integration_tests/performance/test_vsock.py",
+        "devtool_opts": "-c 1-10 -m 0",
+    },
+    "memory-hotplug": {
+        "label": "memory-hotplug",
+        "tests": "integration_tests/performance/test_hotplug_memory.py",
+        "devtool_opts": "-c 1-10 -m 0",
+        # The test require polling (5 ms), so any change smaller than that is not significant.
+        # Additionally, unplugging memory is dependent on how exactly it's being used, so some volatility is expected.
+        "ab_opts": "--absolute-strength 0.005 --noise-threshold hotunplug_total_time=0.1",
     },
     "snapshot-latency": {
-        "label": "📸 Snapshot Latency",
+        "label": "snapshot-latency",
         "tests": "integration_tests/performance/test_snapshot.py::test_restore_latency integration_tests/performance/test_snapshot.py::test_post_restore_latency integration_tests/performance/test_snapshot.py::test_snapshot_create_latency",
         "devtool_opts": "-c 1-12 -m 0",
     },
     "population-latency": {
-        "label": "📸 Memory Population Latency",
+        "label": "population-latency",
         "tests": "integration_tests/performance/test_snapshot.py::test_population_latency",
         "devtool_opts": "-c 1-12 -m 0",
     },
-    "vsock-throughput": {
-        "label": "🧦 Vsock Throughput",
-        "tests": "integration_tests/performance/test_vsock.py",
+    "memory-overhead": {
+        "label": "memory-overhead",
+        "tests": "integration_tests/performance/test_memory_overhead.py",
         "devtool_opts": "-c 1-10 -m 0",
     },
-    "memory-overhead": {
-        "label": "💾 Memory Overhead and 👢 Boottime",
-        "tests": "integration_tests/performance/test_memory_overhead.py integration_tests/performance/test_boottime.py::test_boottime",
+    "boottime": {
+        "label": "boottime",
+        "tests": "integration_tests/performance/test_boottime.py::test_boottime",
+        "devtool_opts": "-c 1-10 -m 0",
+    },
+    "process-startup": {
+        "label": "process-startup",
+        "tests": "integration_tests/performance/test_process_startup_time.py",
         "devtool_opts": "-c 1-10 -m 0",
     },
     "jailer": {
-        "label": "⛓️ jailer",
+        "label": "jailer",
         "tests": "integration_tests/performance/test_jailer.py",
+        "devtool_opts": "-c 1-10 -m 0",
+        "ab_opts": "--noise-threshold startup=0.1",
+    },
+    "mmds": {
+        "label": "mmds",
+        "tests": "integration_tests/performance/test_mmds.py",
         "devtool_opts": "-c 1-10 -m 0",
     },
 }
 
 REVISION_A = os.environ.get("REVISION_A")
 REVISION_B = os.environ.get("REVISION_B")
+REVISION_A_ARTIFACTS = os.environ.get("REVISION_A_ARTIFACTS")
+REVISION_B_ARTIFACTS = os.environ.get("REVISION_B_ARTIFACTS")
+A_B_TEST_MAX_ITERATIONS = 4
 
 # Either both are specified or neither. Only doing either is a bug. If you want to
 # run performance tests _on_ a specific commit, specify neither and put your commit
 # into buildkite's "commit" field.
 assert (REVISION_A and REVISION_B) or (not REVISION_A and not REVISION_B)
+assert (REVISION_A_ARTIFACTS and REVISION_B_ARTIFACTS) or (
+    not REVISION_A_ARTIFACTS and not REVISION_B_ARTIFACTS
+)
 
 BKPipeline.parser.add_argument(
     "--test",
@@ -83,41 +115,48 @@ BKPipeline.parser.add_argument(
     action="append",
 )
 
-retry = {}
-if REVISION_A:
-    # Enable automatic retry and disable manual retries to suppress spurious issues.
-    retry["automatic"] = [
-        {"exit_status": -1, "limit": 1},
-        {"exit_status": 1, "limit": 1},
-    ]
-    retry["manual"] = False
-
 pipeline = BKPipeline(
     # Boost priority from 1 to 2 so these jobs are preferred by ag=1 agents
     priority=2,
     # use ag=1 instances to make sure no two performance tests are scheduled on the same instance
     agents={"ag": 1},
-    retry=retry,
+    # Heavy post-failure dumps (full snapshot + chroot copy) are useful
+    # for triaging performance flakes that are hard to reproduce locally.
+    # Cheap dumps are always on; this flag turns the heavy block on.
+    env={"FC_TEST_DUMP_ON_FAILURE": "1"},
 )
 
-tests = [perf_test[test] for test in pipeline.args.test or perf_test.keys()]
+if pipeline.args.test:
+    tests = [perf_test[test] for test in pipeline.args.test]
+else:
+    tests = perf_test.values()
+
 for test in tests:
     devtool_opts = test.pop("devtool_opts")
     test_selector = test.pop("tests")
     ab_opts = test.pop("ab_opts", "")
     devtool_opts += " --performance"
     test_script_opts = ""
+    artifacts = []
     if REVISION_A:
         devtool_opts += " --ab"
-        test_script_opts = f'{ab_opts} run build/{REVISION_A}/ build/{REVISION_B} --pytest-opts "{test_selector}"'
+        test_script_opts = f'{ab_opts} run --binaries-a build/{REVISION_A}/ --binaries-b build/{REVISION_B} --max-iterations={A_B_TEST_MAX_ITERATIONS} --pytest-opts "{test_selector}"'
+        if REVISION_A_ARTIFACTS:
+            artifacts.append(REVISION_A_ARTIFACTS)
+            artifacts.append(REVISION_B_ARTIFACTS)
+            test_script_opts += f" --artifacts-a {REVISION_A_ARTIFACTS} --artifacts-b {REVISION_B_ARTIFACTS}"
     else:
         # Passing `-m ''` below instructs pytest to collect tests regardless of
         # their markers (e.g. it will collect both tests marked as nonci, and
         # tests without any markers).
         test_script_opts += f" -m '' {test_selector}"
 
+    command = []
+    if artifacts:
+        command.append(pipeline.devtool_download_artifacts(artifacts))
+    command.extend(pipeline.devtool_test(devtool_opts, test_script_opts))
     pipeline.build_group(
-        command=pipeline.devtool_test(devtool_opts, test_script_opts),
+        command=command,
         # and the rest can be command arguments
         **test,
     )

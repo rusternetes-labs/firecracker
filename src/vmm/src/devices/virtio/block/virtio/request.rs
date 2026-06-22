@@ -297,7 +297,7 @@ impl Request {
             RequestType::In | RequestType::Out => {
                 // Check that the data length is a multiple of 512 as specified in the virtio
                 // standard.
-                if req.data_len % SECTOR_SIZE != 0 {
+                if !req.data_len.is_multiple_of(SECTOR_SIZE) {
                     return Err(VirtioBlockError::InvalidDataLength);
                 }
                 let top_sector = req
@@ -308,10 +308,8 @@ impl Request {
                     return Err(VirtioBlockError::InvalidOffset);
                 }
             }
-            RequestType::GetDeviceID => {
-                if req.data_len < VIRTIO_BLK_ID_BYTES {
-                    return Err(VirtioBlockError::InvalidDataLength);
-                }
+            RequestType::GetDeviceID if req.data_len < VIRTIO_BLK_ID_BYTES => {
+                return Err(VirtioBlockError::InvalidDataLength);
             }
             _ => {}
         }

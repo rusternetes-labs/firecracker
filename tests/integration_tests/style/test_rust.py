@@ -3,6 +3,7 @@
 """Tests ensuring codebase style compliance for Rust."""
 
 from framework import utils
+from host_tools.fcmetrics import find_unused_metrics
 
 
 def test_rust_order():
@@ -16,11 +17,26 @@ def test_rust_order():
 
 def test_rust_style():
     """Test that rust code passes style checks."""
-
-    #  ../src/io_uring/src/bindings.rs
-    config = open("fmt.toml", encoding="utf-8").read().replace("\n", ",")
     # Check that the output is empty.
-    _, stdout, _ = utils.check_output(f"cargo fmt --all -- --check --config {config}")
+    _, stdout, _ = utils.check_output("cargo fmt --all -- --check")
 
     # rustfmt prepends `"Diff in"` to the reported output.
     assert "Diff in" not in stdout
+
+
+def test_unused_metrics():
+    """Tests that all metrics defined in Firecracker's metrics.rs files actually have code
+    paths that increment them."""
+    unused = find_unused_metrics()
+
+    for file_path, fields in unused.items():
+        print(f"📄 Defined in: {file_path}")
+        print("Possibly Unused: \n")
+        for field, field_type in fields:
+            print(f"   ❌ {field} ({field_type})")
+
+        print()
+
+    assert (
+        not unused
+    ), "Unused metrics founds, see stdout. Please either hook them up, or remove them"

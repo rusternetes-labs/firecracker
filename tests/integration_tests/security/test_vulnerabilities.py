@@ -14,10 +14,13 @@ import requests
 
 from framework import utils
 from framework.ab_test import git_clone
+from framework.artifacts import pin_pci
 from framework.microvm import MicroVMFactory
 from framework.properties import global_props
+from framework.utils_cpu_templates import ALL_CPU_TEMPLATES, pin_cpu_template
 
-CHECKER_URL = "https://raw.githubusercontent.com/speed47/spectre-meltdown-checker/master/spectre-meltdown-checker.sh"
+# Pinned due to issues introduced in https://github.com/speed47/spectre-meltdown-checker/pull/527
+CHECKER_URL = "https://raw.githubusercontent.com/speed47/spectre-meltdown-checker/3a822fdcf291ebb8bfbcb77aa216ac342c6b2f12/spectre-meltdown-checker.sh"
 CHECKER_FILENAME = "spectre-meltdown-checker.sh"
 REMOTE_CHECKER_PATH = f"/tmp/{CHECKER_FILENAME}"
 REMOTE_CHECKER_COMMAND = f"sh {REMOTE_CHECKER_PATH} --no-intel-db --batch json"
@@ -107,13 +110,8 @@ def download_spectre_meltdown_checker(tmp_path_factory):
 
 # Nothing can be sensibly tested in a PR context here
 @pytest.mark.skipif(
-    global_props.buildkite_pr,
+    global_props.buildkite_pr or global_props.is_dev_env,
     reason="Test depends solely on factors external to GitHub repository",
-)
-# Temporary suppression for Ubuntu 6.14 kernel
-@pytest.mark.skipif(
-    "Ubuntu" in global_props.os and global_props.host_linux_version == "6.14",
-    reason="Ubuntu does not enable CONFIG_MITIGATION_GDS on 6.14 kernel",
 )
 def test_spectre_meltdown_checker_on_host(spectre_meltdown_checker):
     """Test with the spectre / meltdown checker on host."""
@@ -123,13 +121,8 @@ def test_spectre_meltdown_checker_on_host(spectre_meltdown_checker):
 
 # Nothing can be sensibly tested here in a PR context
 @pytest.mark.skipif(
-    global_props.buildkite_pr,
+    global_props.buildkite_pr or global_props.is_dev_env,
     reason="Test depends solely on factors external to GitHub repository",
-)
-# Temporary suppression for Ubuntu 6.14 kernel
-@pytest.mark.skipif(
-    "Ubuntu" in global_props.os and global_props.host_linux_version == "6.14",
-    reason="Ubuntu does not enable CONFIG_MITIGATION_GDS on 6.14 kernel",
 )
 def test_vulnerabilities_on_host():
     """Test vulnerability files on host."""
@@ -213,18 +206,32 @@ def microvm_factory_a(record_property):
 
 
 @pytest.fixture
-def uvm_any_a(microvm_factory_a, uvm_ctor, guest_kernel, rootfs, cpu_template_any):
-    """Return uvm with revision A firecracker
+def uvm_any_a(
+    microvm_factory_a,
+    uvm_lifecycle,
+    guest_kernel,
+    rootfs,
+    pci_enabled,
+    cpu_template,
+):
+    """Return uvm with revision A firecracker, matching uvm_any's lifecycle.
 
-    Since pytest caches fixtures, this guarantees uvm_any_a will match a vm from uvm_any.
-    See https://docs.pytest.org/en/stable/how-to/fixtures.html#fixtures-can-be-requested-more-than-once-per-test-return-values-are-cached
+    Both `uvm_any` and `uvm_any_a` depend on `uvm_lifecycle`, which guarantees
+    they pick the same booted/restored state per test run.
     """
-    return uvm_ctor(microvm_factory_a, guest_kernel, rootfs, cpu_template_any, False)
+    builder = (
+        microvm_factory_a.build_booted
+        if uvm_lifecycle == "booted"
+        else microvm_factory_a.build_restored
+    )
+    return builder(guest_kernel, rootfs, pci=pci_enabled, cpu_template=cpu_template)
 
 
-def test_check_vulnerability_files_ab(request, uvm_any_without_pci):
+@pin_pci(False)
+@pin_cpu_template(ALL_CPU_TEMPLATES)
+def test_check_vulnerability_files_ab(request, uvm_any):
     """Test vulnerability files on guests"""
-    res_b = check_vulnerabilities_files_on_guest(uvm_any_without_pci)
+    res_b = check_vulnerabilities_files_on_guest(uvm_any)
     if global_props.buildkite_pr:
         # we only get the uvm_any_a fixtures if we need it
         uvm_a = request.getfixturevalue("uvm_any_a")
@@ -234,13 +241,15 @@ def test_check_vulnerability_files_ab(request, uvm_any_without_pci):
         assert not [x for x in res_b if "Vulnerable" in x["stdout"]]
 
 
+@pin_pci(False)
+@pin_cpu_template(ALL_CPU_TEMPLATES)
 def test_spectre_meltdown_checker_on_guest(
     request,
-    uvm_any_without_pci,
+    uvm_any,
     spectre_meltdown_checker,
 ):
     """Test with the spectre / meltdown checker on any supported guest."""
-    res_b = spectre_meltdown_checker.get_report_for_guest(uvm_any_without_pci)
+    res_b = spectre_meltdown_checker.get_report_for_guest(uvm_any)
     if global_props.buildkite_pr:
         # we only get the uvm_any_a fixtures if we need it
         uvm_a = request.getfixturevalue("uvm_any_a")
@@ -248,5 +257,5 @@ def test_spectre_meltdown_checker_on_guest(
         assert res_b <= res_a
     else:
         assert res_b == spectre_meltdown_checker.expected_vulnerabilities(
-            uvm_any_without_pci.cpu_template_name
+            uvm_any.cpu_template_name
         )

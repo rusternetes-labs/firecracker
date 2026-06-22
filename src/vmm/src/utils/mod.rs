@@ -10,20 +10,15 @@ pub mod signal;
 /// Module with state machine
 pub mod sm;
 
+use std::fs::{File, OpenOptions};
 use std::num::Wrapping;
-use std::result::Result;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+
+use libc::O_NONBLOCK;
 
 /// How many bits to left-shift by to convert MiB to bytes
 const MIB_TO_BYTES_SHIFT: usize = 20;
-
-/// Return the default page size of the platform, in bytes.
-pub fn get_page_size() -> Result<usize, vmm_sys_util::errno::Error> {
-    // SAFETY: Safe because the parameters are valid.
-    match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
-        -1 => Err(vmm_sys_util::errno::Error::last()),
-        ps => Ok(usize::try_from(ps).unwrap()),
-    }
-}
 
 /// Safely converts a u64 value to a usize value.
 /// This bypasses the Clippy lint check because we only support 64-bit platforms.
@@ -54,6 +49,11 @@ pub const fn mib_to_bytes(mib: usize) -> usize {
     mib << MIB_TO_BYTES_SHIFT
 }
 
+/// Converts Bytes to MiB, truncating any remainder
+pub const fn bytes_to_mib(bytes: usize) -> usize {
+    bytes >> MIB_TO_BYTES_SHIFT
+}
+
 /// Align address up to the aligment.
 pub const fn align_up(addr: u64, align: u64) -> u64 {
     debug_assert!(align != 0);
@@ -64,4 +64,18 @@ pub const fn align_up(addr: u64, align: u64) -> u64 {
 pub const fn align_down(addr: u64, align: u64) -> u64 {
     debug_assert!(align != 0);
     addr & !(align - 1)
+}
+
+/// Create and open a file for both reading and writing to it with a O_NONBLOCK flag.
+/// In case we open a FIFO, we need all READ, WRITE and O_NONBLOCK in order to not block the process
+/// if nobody is consuming the message. Otherwise opening the FIFO with only WRITE and O_NONBLOCK
+/// will fail with ENXIO if there is no readier already attached to it.
+/// NOTE: writing to a pipe will start failing when reaching 64K of unconsumed content.
+pub fn open_file_nonblock(path: &Path) -> Result<File, std::io::Error> {
+    OpenOptions::new()
+        .custom_flags(O_NONBLOCK)
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
 }

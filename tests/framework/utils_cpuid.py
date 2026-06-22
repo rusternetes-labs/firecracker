@@ -32,13 +32,16 @@ class CpuModel(str, Enum):
     INTEL_CASCADELAKE = "INTEL_CASCADELAKE"
     INTEL_ICELAKE = "INTEL_ICELAKE"
     INTEL_SAPPHIRE_RAPIDS = "INTEL_SAPPHIRE_RAPIDS"
+    INTEL_GRANITE_RAPIDS = "INTEL_GRANITE_RAPIDS"
 
 
 CPU_DICT = {
     CpuVendor.INTEL: {
         "Intel(R) Xeon(R) Platinum 8259CL CPU": "INTEL_CASCADELAKE",
+        "Intel(R) Xeon(R) Platinum 8275CL CPU": "INTEL_CASCADELAKE",
         "Intel(R) Xeon(R) Platinum 8375C CPU": "INTEL_ICELAKE",
         "Intel(R) Xeon(R) Platinum 8488C": "INTEL_SAPPHIRE_RAPIDS",
+        "Intel(R) Xeon(R) 6975P-C": "INTEL_GRANITE_RAPIDS",
     },
     CpuVendor.AMD: {"AMD EPYC 7R13": "AMD_MILAN", "AMD EPYC 9R14": "AMD_GENOA"},
     CpuVendor.ARM: {
